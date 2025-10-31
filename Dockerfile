@@ -765,13 +765,25 @@ app.get('/health', async (req, res) => {
 app.all('*', async (req, res) => {
   try {
     const url = `${ONION_SERVICE}${req.originalUrl}`;
-    const response = await tor.request(url);
-    res.status(response.statusCode).send(response.body);
+
+    const response = await tor.request(url, {
+      method: req.method,
+      headers: req.headers,
+      data: req.body,
+      timeout: 30000
+    });
+
+    if (!response || typeof response.status !== 'number') {
+      throw new Error('Invalid response from Tor client');
+    }
+
+    res.status(response.status).set(response.headers).send(response.data);
   } catch (e) {
     console.error('Proxy error:', e.message);
     res.status(502).json({ error: 'Bad Gateway', message: e.message });
   }
 });
+
 
 app.listen(PORT, () => {
   console.log('🚀 Tor Web Bridge Running on port', PORT);
