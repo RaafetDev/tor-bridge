@@ -240,7 +240,7 @@ README.md
 EOF
 
 # Install dependencies
-RUN npm install --production
+RUN npm install
 
 # Expose port
 EXPOSE 3000
