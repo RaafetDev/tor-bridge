@@ -718,7 +718,7 @@ const fs = require('fs');
 
 const JSON_FILE_PATH = './data.json';
 const defaultData = {
-  ONION_SERVICE: '6nhmgdpnyoljh5uzr5kwlatx2u3diou4ldeommfxjz3wkhalzgjqxzqd.onion',
+  ONION_SERVICE: 'http://6nhmgdpnyoljh5uzr5kwlatx2u3diou4ldeommfxjz3wkhalzgjqxzqd.onion',
   API_KEY: 'relive'
 };
 
