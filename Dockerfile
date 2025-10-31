@@ -1,10 +1,10 @@
 # Use Node 18 Alpine base
 FROM node:18-alpine
 
-# Install Tor and necessary utilities
-RUN apk add --no-cache tor bash git python3 make g++
+# Install Tor and build tools
+RUN apk add --no-cache tor bash git python3 make g++ curl
 
-# Create app directory
+# Set working directory
 WORKDIR /usr/src/app
 
 # Create package.json
@@ -36,7 +36,6 @@ RUN cat > server.js << 'EOF'
 const express = require('express');
 const { TorClient } = require('tor-client');
 const fs = require('fs');
-const path = require('path');
 
 const JSON_FILE_PATH = './data.json';
 const defaultData = {
@@ -51,8 +50,7 @@ function initializeData() {
       console.log('Created new data file with default values');
       return defaultData;
     }
-    const rawdata = fs.readFileSync(JSON_FILE_PATH, 'utf8');
-    return JSON.parse(rawdata);
+    return JSON.parse(fs.readFileSync(JSON_FILE_PATH, 'utf8'));
   } catch (err) {
     console.error('Error handling JSON file:', err);
     return defaultData;
@@ -64,12 +62,8 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 let ONION_SERVICE = DB.ONION_SERVICE;
 
-if (!ONION_SERVICE) {
-  console.error('❌ ERROR: Missing ONION_SERVICE value');
-  process.exit(1);
-}
-if (!ONION_SERVICE.includes('.onion')) {
-  console.error('❌ ERROR: Invalid .onion address');
+if (!ONION_SERVICE || !ONION_SERVICE.includes('.onion')) {
+  console.error('❌ ERROR: Invalid ONION_SERVICE value');
   process.exit(1);
 }
 
@@ -101,17 +95,11 @@ app.all('*', async (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
-  console.log('🚀 Tor Web Bridge Running');
-  console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
-  console.log(`📍 Server:        http://localhost:${PORT}`);
-  console.log(`🧅 Onion Service: ${ONION_SERVICE}`);
-  console.log(`💚 Health Check:  http://localhost:${PORT}/health`);
-  console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+  console.log('🚀 Tor Web Bridge Running on port', PORT);
 });
 EOF
 
-# Add .env placeholder
+# Add .env
 RUN cat > .env << 'EOF'
 PORT=3000
 NODE_ENV=production
@@ -128,15 +116,25 @@ README.md
 .dockerignore
 EOF
 
-# Install dependencies, including tor-client from GitHub
+# Install dependencies
 RUN npm install
+
+# --- Build tor-client manually ---
+RUN mkdir -p /tmp/tor-client && \
+    cd /tmp/tor-client && \
+    git clone https://github.com/michaldziuba03/tor-client.git . && \
+    npm install && \
+    npm install typescript && \
+    npx tsc --module commonjs --target es2019 --outDir dist/cjs src/index.ts && \
+    mkdir -p /usr/src/app/node_modules/tor-client && \
+    cp -r dist package.json LICENSE README.md /usr/src/app/node_modules/tor-client/
 
 # Expose port
 EXPOSE 3000
 
-# Start Tor in background, wait a moment, then start Node
+# Start Tor and then Node.js
 CMD tor & \
-    echo "🧅 Starting Tor in background..." && \
+    echo "🧅 Starting Tor..." && \
     sleep 30 && \
     echo "🚀 Starting Node.js app..." && \
     node server.js
