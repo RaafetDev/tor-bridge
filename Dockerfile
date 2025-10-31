@@ -2,7 +2,7 @@
 FROM node:18-alpine
 
 # Install Tor and necessary utilities
-RUN apk add --no-cache tor bash
+RUN apk add --no-cache tor bash git
 
 # Create app directory
 WORKDIR /usr/src/app
