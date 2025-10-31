@@ -645,6 +645,20 @@ var require_tor = __commonJS({
           });
         });
       }
+      request(url, options = {}) {
+        return __awaiter(this, void 0, void 0, function* () {
+          const { protocol, host, port } = this.getDestination(url);
+          const socket = yield this.connectSocks(host, port);
+          const agent = this.createAgent(protocol, socket);
+          return this.http.request(url, {
+            agent,
+            method: options.method,
+            headers: options.headers,
+            data: options.data,
+            timeout: options.timeout
+          });
+        });
+      }
       get(url, options = {}) {
         return __awaiter(this, void 0, void 0, function* () {
           const { protocol, host, port } = this.getDestination(url);
