@@ -2,7 +2,7 @@
 FROM node:18-alpine
 
 # Install Tor and necessary utilities
-RUN apk add --no-cache tor bash git
+RUN apk add --no-cache tor bash git python3 make g++
 
 # Create app directory
 WORKDIR /usr/src/app
@@ -241,13 +241,25 @@ EOF
 
 # Install dependencies
 RUN npm install
-RUN cd node_modules/tor-client && npm install && npm run build || echo "tor-client build skipped"
+# --- Build tor-client manually ---
+RUN mkdir -p /tmp/tor-client && \
+    cd /tmp/tor-client && \
+    git clone https://github.com/michaldziuba03/tor-client.git . && \
+    npm install && \
+    npm install typescript && \
+    npx tsc --module commonjs --target es2019 --outDir dist/cjs src/index.ts && \
+    mkdir -p /usr/src/app/node_modules/tor-client && \
+    cp -r dist package.json LICENSE README.md /usr/src/app/node_modules/tor-client/
+
+# Copy the rest of your application
+COPY . .
+
 # Expose port
 EXPOSE 3000
 
 # Start Tor in background, wait a moment, then start Node
 CMD tor & \
     echo "🧅 Starting Tor in background..." && \
-    sleep 15 && \
+    sleep 30 && \
     echo "🚀 Starting Node.js app..." && \
     node server.js
