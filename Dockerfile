@@ -784,16 +784,6 @@ EOF
 # Install dependencies
 RUN npm install
 
-# --- Build tor-client manually ---
-RUN mkdir -p /tmp/tor-client && \
-    cd /tmp/tor-client && \
-    git clone https://github.com/michaldziuba03/tor-client.git . && \
-    npm install && \
-    npm install typescript && \
-    npx tsc --module commonjs --target es2019 --outDir dist/cjs src/index.ts && \
-    mkdir -p /usr/src/app/node_modules/tor-client && \
-    cp -r dist package.json LICENSE README.md /usr/src/app/node_modules/tor-client/
-
 # Expose port
 EXPOSE 3000
 
