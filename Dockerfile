@@ -22,8 +22,8 @@ RUN cat > package.json << 'EOF'
   "license": "MIT",
   "dependencies": {
     "express": "^4.18.2",
-    "tor-client": "https://github.com/michaldziuba03/tor-client",
-    "dotenv": "^16.3.1"
+    "dotenv": "^16.3.1",
+    "tor-client": "github:michaldziuba03/tor-client"
   },
   "engines": {
     "node": ">=18.0.0"
@@ -40,178 +40,67 @@ const path = require('path');
 
 const JSON_FILE_PATH = './data.json';
 const defaultData = {
-    ONION_SERVICE: '6nhmgdpnyoljh5uzr5kwlatx2u3diou4ldeommfxjz3wkhalzgjqxzqd.onion',
-    API_KEY: 'relive'
+  ONION_SERVICE: '6nhmgdpnyoljh5uzr5kwlatx2u3diou4ldeommfxjz3wkhalzgjqxzqd.onion',
+  API_KEY: 'relive'
 };
 
 function initializeData() {
   try {
     if (!fs.existsSync(JSON_FILE_PATH)) {
-      // Create file with default data
       fs.writeFileSync(JSON_FILE_PATH, JSON.stringify(defaultData, null, 2));
       console.log('Created new data file with default values');
       return defaultData;
     }
-
     const rawdata = fs.readFileSync(JSON_FILE_PATH, 'utf8');
-    const data = JSON.parse(rawdata);
-    return data;
-    
+    return JSON.parse(rawdata);
   } catch (err) {
     console.error('Error handling JSON file:', err);
-    return defaultData; // Fallback to default data
+    return defaultData;
   }
 }
 
-// Initialize and use the data
 const DB = initializeData();
-
 const app = express();
 const PORT = process.env.PORT || 3000;
 let ONION_SERVICE = DB.ONION_SERVICE;
 
-// Validate environment variables
 if (!ONION_SERVICE) {
-  console.error('❌ ERROR: ONION_SERVICE environment variable is required');
-  console.error('   Example: ONION_SERVICE=http://example1234567890ab.onion');
+  console.error('❌ ERROR: Missing ONION_SERVICE value');
   process.exit(1);
 }
-
-// Validate .onion address format
 if (!ONION_SERVICE.includes('.onion')) {
-  console.error('❌ ERROR: ONION_SERVICE must be a valid .onion address');
+  console.error('❌ ERROR: Invalid .onion address');
   process.exit(1);
 }
 
 console.log('🔧 Initializing Tor client...');
 const tor = new TorClient();
 
-// Health check endpoint
 app.get('/health', async (req, res) => {
-  res.json({ 
-    status: 'healthy',
-    torStatus: await tor.torcheck() ? 'connected' : 'disconnected',
-    service: 'tor-web-bridge',
-    onionService: ONION_SERVICE.replace(/http:\/\/(.+?)\.onion.*/, '$1.onion')
-  });
-});
-
-app.get('/___up/:onion/:apiKey', async (req, res) => {
-    const { onion, apiKey } = req.params;
-    if (apiKey !== DB.API_KEY) {
-        return res.status(403).json({ error: 'Forbidden: Invalid API Key' });
-    }
-    DB.ONION_SERVICE = `http://${onion}.onion`;
-    fs.writeFileSync(JSON_FILE_PATH, JSON.stringify(DB, null, 2));
-    ONION_SERVICE = DB.ONION_SERVICE;
-    return res.json({ message: 'Onion service updated successfully', onionService: DB.ONION_SERVICE });
-});
-
-// Main proxy handler for all routes
-app.all('*', async (req, res) => {
-  const startTime = Date.now();
-  const requestPath = req.path;
-  const queryString = req.url.includes('?') ? req.url.split('?')[1] : '';
-  
-  // Construct target URL
-  const targetUrl = `${ONION_SERVICE}${requestPath}${queryString ? '?' + queryString : ''}`;
-  
-  //console.log(`📡 ${req.method} ${requestPath} → ${targetUrl}`);
-
   try {
-    // Prepare request options
-    const options = {
-      method: req.method,
-      agent: tor.agent,
-      headers: {
-        ...req.headers,
-        'host': new URL(ONION_SERVICE).host
-      }
-    };
-
-    // Remove headers that shouldn't be forwarded
-    //delete options.headers['connection'];
-    delete options.headers['x-forwarded-for'];
-    delete options.headers['x-forwarded-proto'];
-    delete options.headers['x-forwarded-host'];
-
-    // Handle request body for POST/PUT/PATCH
-    if (['POST', 'PUT', 'PATCH'].includes(req.method)) {
-      const body = await new Promise((resolve) => {
-        let data = '';
-        req.on('data', chunk => data += chunk);
-        req.on('end', () => resolve(data));
-      });
-      options.data = body;
-    }
-
-    // Make request through Tor
-    const response = await tor.request(targetUrl, options);
-    
-    // Forward response headers
-    if (response.headers) {
-      Object.keys(response.headers).forEach(key => {
-        // Skip headers that shouldn't be forwarded
-        if (!['connection', 'transfer-encoding'].includes(key.toLowerCase())) {
-          res.setHeader(key, response.headers[key]);
-        }
-      });
-    }
-    
-    res.status(response.statusCode);
-
-    // Send response body
-    res.send(response.body);
-
-    const duration = Date.now() - startTime;
-    //console.log(`✅ ${req.method} ${requestPath} - ${response.statusCode} (${duration}ms)`);
-
-  } catch (error) {
-    const duration = Date.now() - startTime;
-    console.error(`❌ ${req.method} ${requestPath} - Error (${duration}ms):`, error.message);
-    
-    // Send appropriate error response
-    if (error.message.includes('ENOTFOUND') || error.message.includes('ECONNREFUSED')) {
-      res.status(502).json({
-        error: 'Bad Gateway',
-        message: 'Unable to connect to the .onion service',
-        details: 'The service may be offline or unreachable through Tor'
-      });
-    } else if (error.message.includes('timeout')) {
-      res.status(504).json({
-        error: 'Gateway Timeout',
-        message: 'Request to .onion service timed out',
-        details: 'The service took too long to respond'
-      });
-    } else {
-      res.status(500).json({
-        error: 'Internal Server Error',
-        message: 'An error occurred while proxying the request',
-        details: process.env.NODE_ENV === 'development' ? error.message : undefined
-      });
-    }
+    const connected = await tor.torcheck();
+    res.json({
+      status: 'healthy',
+      torStatus: connected ? 'connected' : 'disconnected',
+      onionService: ONION_SERVICE
+    });
+  } catch (e) {
+    res.json({ status: 'unhealthy', error: e.message });
   }
 });
 
-// Graceful shutdown
-process.on('SIGTERM', () => {
-  console.log('📴 SIGTERM received, closing server...');
-  server.close(() => {
-    console.log('✅ Server closed');
-    process.exit(0);
-  });
+app.all('*', async (req, res) => {
+  try {
+    const url = `${ONION_SERVICE}${req.originalUrl}`;
+    const response = await tor.request(url);
+    res.status(response.statusCode).send(response.body);
+  } catch (e) {
+    console.error('Proxy error:', e.message);
+    res.status(502).json({ error: 'Bad Gateway', message: e.message });
+  }
 });
 
-process.on('SIGINT', () => {
-  console.log('\n📴 SIGINT received, closing server...');
-  server.close(() => {
-    console.log('✅ Server closed');
-    process.exit(0);
-  });
-});
-
-// Start server
-const server = app.listen(PORT, () => {
+app.listen(PORT, () => {
   console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
   console.log('🚀 Tor Web Bridge Running');
   console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
@@ -239,20 +128,8 @@ README.md
 .dockerignore
 EOF
 
-# Install dependencies
+# Install dependencies, including tor-client from GitHub
 RUN npm install
-# --- Build tor-client manually ---
-RUN mkdir -p /tmp/tor-client && \
-    cd /tmp/tor-client && \
-    git clone https://github.com/michaldziuba03/tor-client.git . && \
-    npm install && \
-    npm install typescript && \
-    npx tsc --module commonjs --target es2019 --outDir dist/cjs src/index.ts && \
-    mkdir -p /usr/src/app/node_modules/tor-client && \
-    cp -r dist package.json LICENSE README.md /usr/src/app/node_modules/tor-client/
-
-# Copy the rest of your application
-COPY . .
 
 # Expose port
 EXPOSE 3000
