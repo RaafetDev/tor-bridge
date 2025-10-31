@@ -22,7 +22,7 @@ RUN cat > package.json << 'EOF'
   "license": "MIT",
   "dependencies": {
     "express": "^4.18.2",
-    "tor-client": "^1.3.1",
+    "tor-client": "https://github.com/michaldziuba03/tor-client",
     "dotenv": "^16.3.1"
   },
   "engines": {
