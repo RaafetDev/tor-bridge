@@ -241,13 +241,13 @@ EOF
 
 # Install dependencies
 RUN npm install
-
+RUN cd node_modules/tor-client && npm install && npm run build || echo "tor-client build skipped"
 # Expose port
 EXPOSE 3000
 
 # Start Tor in background, wait a moment, then start Node
 CMD tor & \
     echo "🧅 Starting Tor in background..." && \
-    sleep 5 && \
+    sleep 15 && \
     echo "🚀 Starting Node.js app..." && \
     node server.js
