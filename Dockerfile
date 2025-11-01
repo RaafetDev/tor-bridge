@@ -46,7 +46,7 @@ import threading
 import time
 import logging
 
-ONION = os.environ['ONION_DOMAIN']
+ONION = "https://torproject.org"
 TOR_SOCKS = "socks5://127.0.0.1:9050"
 TIMEOUT = 30
 logging.basicConfig(level=logging.INFO)
@@ -113,5 +113,5 @@ CMD /bin/bash -c "\
     tor -f /etc/tor/torrc & \
     sleep 12 && \
     echo 'SHΔDØW: Tor daemon summoned.' && \
-    gunicorn --bind 0.0.0.0:${PORT} --workers 1 --threads 2 --timeout 120 app:app --preload
+    gunicorn --bind 0.0.0.0:${PORT} --workers 1 --threads 2 --timeout 120 app:app --preload \
 "
