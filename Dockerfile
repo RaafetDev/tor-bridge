@@ -1,54 +1,32 @@
-# SHΔDØW CORE: SINGLE-FILE TOR2WEB PROXY — RENDER.COM FREE TIER
-# No repo. No config. No escape.
-# DEPLOY: Paste into Render > Web Service > Docker > Paste Dockerfile > Add Env: ONION_DOMAIN=youronion.onion
-# URL: https://yourapp.onrender.com → proxies to youronion.onion
+# SHΔDØW CORE: ULTRA-LIGHT TOR2WEB PROXY — RENDER.COM FREE TIER
+# DEPLOY: Paste into Render > Web Service > Docker > Add Env: ONION_DOMAIN=youronion.onion
+# NO COMPILE. NO BLOAT. PURE SHADOW.
 
 FROM ubuntu:22.04
 
-# === ENVIRONMENT: LOCKED, LOADED, UNFORGIVING ===
+# === ENVIRONMENT: LOCKED & LOADED ===
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
-    PYTHONDONTWRITEBYTECODE=1 \
-    TOR_VERSION=0.4.8.12 \
-    TOR2WEB_VERSION=3.2.1
+    PYTHONDONTWRITEBYTECODE=1
 
-# === INSTALL TOR + PYTHON + TOR2WEB (FROM SOURCE, NO EXTERNAL REPO) ===
+# === INSTALL TOR + PYTHON + ESSENTIALS (APT = TRUTH) ===
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates \
-    curl \
-    gnupg \
-    build-essential \
-    libevent-dev \
-    libssl-dev \
-    zlib1g-dev \
+    tor \
     python3 \
     python3-pip \
     python3-venv \
-    && rm -rf /var/lib/apt/lists/*
+    curl \
+    && rm -rf /var/lib/apt/lists/* \
+    && apt-get clean
 
-# === DOWNLOAD & COMPILE TOR (OFFICIAL BINARY, NO COMPROMISE) ===
-RUN curl -fsSL https://dist.torproject.org/tor-${TOR_VERSION}.tar.gz -o tor.tar.gz \
-    && tar -xzf tor.tar.gz \
-    && cd tor-${TOR_VERSION} \
-    && ./configure --disable-asciidoc --quiet \
-    && make -j$(nproc) \
-    && make install \
-    && cd .. \
-    && rm -rf tor-${TOR_VERSION} tor.tar.gz
-
-# === DOWNLOAD TOR2WEB (PURE PYTHON, NO GIT) ===
-RUN curl -fsSL https://github.com/tor2web/Tor2web/archive/refs/tags/${TOR2WEB_VERSION}.tar.gz | tar -xz \
-    && mv Tor2web-${TOR2WEB_VERSION} /tor2web
-
-# === PYTHON VENV + DEPENDENCIES ===
+# === PYTHON VENV + PROXY DEPENDENCIES ===
 RUN python3 -m venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
 RUN pip install --no-cache-dir \
     gunicorn \
-    stem \
-    requests \
-    pycurl \
-    flask
+    flask \
+    requests[socks] \
+    stem
 
 # === TOR CONFIG: SOCKS + CONTROL + ONION RESOLUTION ===
 RUN mkdir -p /var/run/tor /var/log/tor
@@ -56,50 +34,41 @@ RUN echo "SocksPort 9050" > /etc/tor/torrc \
     && echo "ControlPort 9051" >> /etc/tor/torrc \
     && echo "CookieAuthentication 1" >> /etc/tor/torrc \
     && echo "AutomapHostsOnResolve 1" >> /etc/tor/torrc \
-    && echo "VirtualAddrNetworkIPv4 10.192.0.0/10" >> /etc/tor/torrc \
     && echo "Log notice stdout" >> /etc/tor/torrc
 
-# === TOR2WEB MINIMAL APP (INJECTED, NO FILES) ===
-RUN mkdir -p /app
-WORKDIR /app
-
 # === SHΔDØW TOR2WEB MICRO-ENGINE (PURE PYTHON, NO DISK) ===
+WORKDIR /app
 RUN cat > app.py << 'PYEOF'
 import os
 import requests
 from flask import Flask, request, Response
-from stem.control import Controller
-from stem import Signal
 import threading
 import time
 import logging
 
-# === CONFIG FROM ENV (RENDER INJECTION) ===
-ONION = "https://torproject.org"
+ONION = os.environ['ONION_DOMAIN']
 TOR_SOCKS = "socks5://127.0.0.1:9050"
 TIMEOUT = 30
 logging.basicConfig(level=logging.INFO)
 
 app = Flask(__name__)
 
-# === TOR BOOTSTRAP CHECK ===
 def wait_for_tor():
     for _ in range(60):
         try:
-            with Controller.from_port(port=9051) as controller:
-                controller.authenticate()
-                if controller.is_alive():
-                    logging.info("SHΔDØW: Tor online.")
-                    return
+            with open('/var/run/tor/control.authcookie', 'rb') as f:
+                cookie = f.read()
+            if len(cookie) == 32:
+                logging.info("SHΔDØW: Tor control cookie ready.")
+                return
         except:
-            time.sleep(5)
-    raise Exception("SHΔDØW: Tor failed to bootstrap.")
+            time.sleep(3)
+    raise Exception("SHΔDØW: Tor failed to start.")
 
 threading.Thread(target=wait_for_tor, daemon=True).start()
 
-# === PROXY CORE: FETCH VIA TOR, STREAM BACK ===
 def proxy_request(path):
-    url = f"{ONION}{path}"
+    url = f"http://{ONION}{path}"
     proxies = {"http": TOR_SOCKS, "https": TOR_SOCKS}
     headers = {k: v for k, v in request.headers if k.lower() != 'host'}
     
@@ -116,21 +85,17 @@ def proxy_request(path):
             timeout=TIMEOUT,
             verify=False
         )
-        
-        headers = [(k, v) for k, v in resp.raw.headers.items()]
-        return Response(resp.content, resp.status_code, headers, direct_passthrough=True)
-    
+        headers_out = [(k, v) for k, v in resp.raw.headers.items()]
+        return Response(resp.content, resp.status_code, headers_out, direct_passthrough=True)
     except Exception as e:
         logging.error(f"SHΔDØW ERROR: {e}")
-        return "SHΔDØW: Onion unreachable or dead.", 502
+        return "SHΔDØW: Onion unreachable.", 502
 
-# === ROUTE: CATCH ALL, PROXY TO ONION ===
 @app.route('/', defaults={'path': ''})
 @app.route('/<path:path>')
 def catch_all(path):
     return proxy_request('/' + path)
 
-# === HEALTHCHECK ===
 @app.route('/.shadow')
 def shadow():
     return "SHΔDØW CORE ACTIVE", 200
@@ -146,7 +111,7 @@ ENV PORT=10000
 # === FINAL RITUAL: START TOR + GUNICORN ===
 CMD /bin/bash -c "\
     tor -f /etc/tor/torrc & \
-    sleep 15 && \
+    sleep 12 && \
     echo 'SHΔDØW: Tor daemon summoned.' && \
-    gunicorn --bind 0.0.0.0:${PORT} --workers 1 --threads 2 --timeout 120 app:app \
+    gunicorn --bind 0.0.0.0:${PORT} --workers 1 --threads 2 --timeout 120 app:app --preload
 "
