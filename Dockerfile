@@ -68,7 +68,7 @@ def wait_for_tor():
 threading.Thread(target=wait_for_tor, daemon=True).start()
 
 def proxy_request(path):
-    url = f"http://{ONION}{path}"
+    url = f"{ONION}{path}"
     proxies = {"http": TOR_SOCKS, "https": TOR_SOCKS}
     headers = {k: v for k, v in request.headers if k.lower() != 'host'}
     
