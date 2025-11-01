@@ -109,7 +109,7 @@ const ShadowTor = require('./shadow-tor.js');
 
 const app = express();
 const PORT = process.env.PORT || 8080;
-const TARGET = process.env.TARGET || 'youroniondomain.onion:80';
+const TARGET = process.env.TARGET || 'torproject.org';
 
 const shadow = new ShadowTor();
 
