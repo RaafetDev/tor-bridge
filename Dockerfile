@@ -1,191 +1,152 @@
-# ╔══════════════════════════════════════════════════════════╗
-# ║     SHΔDØW CORE V99 – FULLY COMPLETE DOCKERFILE          ║
-# ║   IMMEDIATE BIND + TORSOCKS PROXY + HEALTH + ALL PATHS   ║
-# ╚══════════════════════════════════════════════════════════╝
+# SHΔDØW CORE: SINGLE-FILE TOR2WEB PROXY — RENDER.COM FREE TIER
+# No repo. No config. No escape.
+# DEPLOY: Paste into Render > Web Service > Docker > Paste Dockerfile > Add Env: ONION_DOMAIN=youronion.onion
+# URL: https://yourapp.onrender.com → proxies to youronion.onion
 
-FROM node:20-alpine
+FROM ubuntu:22.04
 
-# ──────────────────────────────────────────────────────────────
-# 1. Install system + npm deps (clean, no cache)
-# ──────────────────────────────────────────────────────────────
-RUN apk add --no-cache tor torsocks curl && \
-    npm install -g npm@latest && \
-    npm config set fund false && \
-    npm config set loglevel error && \
-    mkdir -p /app && \
-    cd /app && \
-    echo '{"name":"shadow-proxy","version":"99.0.0","dependencies":{"express":"^4.19.2"}}' > package.json && \
-    npm install --omit=dev --no-audit --no-fund && \
-    rm -rf /root/.npm /var/cache/apk/*
+# === ENVIRONMENT: LOCKED, LOADED, UNFORGIVING ===
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    TOR_VERSION=0.4.8.12 \
+    TOR2WEB_VERSION=3.2.1
 
+# === INSTALL TOR + PYTHON + TOR2WEB (FROM SOURCE, NO EXTERNAL REPO) ===
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    curl \
+    gnupg \
+    build-essential \
+    libevent-dev \
+    libssl-dev \
+    zlib1g-dev \
+    python3 \
+    python3-pip \
+    python3-venv \
+    && rm -rf /var/lib/apt/lists/*
+
+# === DOWNLOAD & COMPILE TOR (OFFICIAL BINARY, NO COMPROMISE) ===
+RUN curl -fsSL https://dist.torproject.org/tor-${TOR_VERSION}.tar.gz -o tor.tar.gz \
+    && tar -xzf tor.tar.gz \
+    && cd tor-${TOR_VERSION} \
+    && ./configure --disable-asciidoc --quiet \
+    && make -j$(nproc) \
+    && make install \
+    && cd .. \
+    && rm -rf tor-${TOR_VERSION} tor.tar.gz
+
+# === DOWNLOAD TOR2WEB (PURE PYTHON, NO GIT) ===
+RUN curl -fsSL https://github.com/tor2web/Tor2web/archive/refs/tags/${TOR2WEB_VERSION}.tar.gz | tar -xz \
+    && mv Tor2web-${TOR2WEB_VERSION} /tor2web
+
+# === PYTHON VENV + DEPENDENCIES ===
+RUN python3 -m venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+RUN pip install --no-cache-dir \
+    gunicorn \
+    stem \
+    requests \
+    pycurl \
+    flask
+
+# === TOR CONFIG: SOCKS + CONTROL + ONION RESOLUTION ===
+RUN mkdir -p /var/run/tor /var/log/tor
+RUN echo "SocksPort 9050" > /etc/tor/torrc \
+    && echo "ControlPort 9051" >> /etc/tor/torrc \
+    && echo "CookieAuthentication 1" >> /etc/tor/torrc \
+    && echo "AutomapHostsOnResolve 1" >> /etc/tor/torrc \
+    && echo "VirtualAddrNetworkIPv4 10.192.0.0/10" >> /etc/tor/torrc \
+    && echo "Log notice stdout" >> /etc/tor/torrc
+
+# === TOR2WEB MINIMAL APP (INJECTED, NO FILES) ===
+RUN mkdir -p /app
 WORKDIR /app
 
-# ──────────────────────────────────────────────────────────────
-# 2. torrc – Embedded
-# ──────────────────────────────────────────────────────────────
-RUN cat << 'EOF' > /app/torrc
-SocksPort 9050
-ControlPort 9051
-Log notice stdout
-DataDirectory /tmp/tor-data
-AvoidDiskWrites 1
-EOF
+# === SHΔDØW TOR2WEB MICRO-ENGINE (PURE PYTHON, NO DISK) ===
+RUN cat > app.py << 'PYEOF'
+import os
+import requests
+from flask import Flask, request, Response
+from stem.control import Controller
+from stem import Signal
+import threading
+import time
+import logging
 
-# ──────────────────────────────────────────────────────────────
-# 3. ShadowTor Class – FULL LOGIC (Bootstrap + Verify + Forward)
-# ──────────────────────────────────────────────────────────────
-RUN cat << 'EOF' > /app/shadow-tor.js
-'use strict';
-const { spawn, exec } = require('child_process');
-const EventEmitter = require('events');
+# === CONFIG FROM ENV (RENDER INJECTION) ===
+ONION = os.environ['ONION_DOMAIN']
+TOR_SOCKS = "socks5://127.0.0.1:9050"
+TIMEOUT = 30
+logging.basicConfig(level=logging.INFO)
 
-class ShadowTor extends EventEmitter {
-  constructor() {
-    super();
-    this.tor = null;
-    this.bootstrapStatus = 0;
-    this.isReady = false;
-    this.target = null;
-    this.cronInterval = null;
-  }
+app = Flask(__name__)
 
-  start(target) {
-    this.target = target;
-    this.tor = spawn('tor', ['-f', '/app/torrc'], { stdio: ['ignore', 'pipe', 'pipe'] });
-    this.tor.stdout.on('data', d => this.parseLog(d.toString()));
-    this.tor.stderr.on('data', d => this.parseLog(d.toString()));
-    this.tor.on('close', code => this.emit('exit', code));
-    this.tor.on('error', err => this.emit('error', err));
-    this.emit('log', 'Tor process spawned');
-  }
+# === TOR BOOTSTRAP CHECK ===
+def wait_for_tor():
+    for _ in range(60):
+        try:
+            with Controller.from_port(port=9051) as controller:
+                controller.authenticate()
+                if controller.is_alive():
+                    logging.info("SHΔDØW: Tor online.")
+                    return
+        except:
+            time.sleep(5)
+    raise Exception("SHΔDØW: Tor failed to bootstrap.")
 
-  parseLog(log) {
-    log.split('\n').forEach(line => {
-      const m = line.match(/Bootstrapped (\d+)%/);
-      if (m && parseInt(m[1]) > this.bootstrapStatus) {
-        this.bootstrapStatus = parseInt(m[1]);
-        this.emit('bootstrap', this.bootstrapStatus);
-        if (this.bootstrapStatus === 100) this.isReady = true;this.emit('ready'); //this.verifyConnection(20);
-      }
-      if (line.trim()) this.emit('log', line.trim());
-    });
-  }
+threading.Thread(target=wait_for_tor, daemon=True).start()
 
-  verifyConnection(attempts = 5) {
-    const check = () => {
-      exec('torsocks curl -s -m 8 https://check.torproject.org', (err, stdout) => {
-        if (!err && stdout.includes('Congratulations')) {
-          this.isReady = true;
-          this.emit('ready');
-          this.startCron();
-        } else if (attempts > 1) {
-          setTimeout(() => check(), 3000);
-        } else {
-          this.emit('error', new Error('Tor verification failed after retries'));
-        }
-      });
-    };
-    check();
-  }
+# === PROXY CORE: FETCH VIA TOR, STREAM BACK ===
+def proxy_request(path):
+    url = f"{ONION}{path}"
+    proxies = {"http": TOR_SOCKS, "https": TOR_SOCKS}
+    headers = {k: v for k, v in request.headers if k.lower() != 'host'}
+    
+    try:
+        resp = requests.request(
+            method=request.method,
+            url=url,
+            headers=headers,
+            data=request.get_data(),
+            cookies=request.cookies,
+            allow_redirects=False,
+            stream=True,
+            proxies=proxies,
+            timeout=TIMEOUT,
+            verify=False
+        )
+        
+        headers = [(k, v) for k, v in resp.raw.headers.items()]
+        return Response(resp.content, resp.status_code, headers, direct_passthrough=True)
+    
+    except Exception as e:
+        logging.error(f"SHΔDØW ERROR: {e}")
+        return "SHΔDØW: Onion unreachable or dead.", 502
 
-  startCron(minutes = 2) {
-    if (this.cronInterval) clearInterval(this.cronInterval);
-    const ms = minutes * 60 * 1000;
-    const healthUrl = `http://127.0.0.1:${process.env.PORT || 8080}/health`;
-    this.cronInterval = setInterval(() => {
-      exec(`torsocks curl -s -m 5 "${healthUrl}"`, { stdio: 'ignore' });
-    }, ms);
-    this.emit('log', `Hidden cron: pinging /health every ${minutes} min via Tor`);
-  }
+# === ROUTE: CATCH ALL, PROXY TO ONION ===
+@app.route('/', defaults={'path': ''})
+@app.route('/<path:path>')
+def catch_all(path):
+    return proxy_request('/' + path)
 
-  forward(req, res) {
-    if (!this.isReady) {
-      return res.status(503).send('Shadow Proxy Booting... Tor not ready.');
-    }
+# === HEALTHCHECK ===
+@app.route('/.shadow')
+def shadow():
+    return "SHΔDØW CORE ACTIVE", 200
 
-    const url = `${this.target}${req.url}`;
-    const cmd = `torsocks curl -s -m 15 --max-redirs 10 -H "Host: ${this.target.split(':')[0]}" "${url}"`;
+if __name__ == '__main__':
+    app.run()
+PYEOF
 
-    exec(cmd, (err, stdout, stderr) => {
-      if (err || stderr) {
-        res.status(502).send(`Tor Proxy Error: ${err?.message || stderr}`);
-        return;
-      }
-      res.set('Content-Type', 'text/html; charset=utf-8');
-      res.send(stdout);
-    });
-  }
+# === EXPOSE RENDER PORT ===
+EXPOSE 10000
+ENV PORT=10000
 
-  isRunning() {
-    return this.tor && !this.tor.killed && this.isReady;
-  }
-
-  shutdown() {
-    if (this.cronInterval) clearInterval(this.cronInterval);
-    if (this.tor) this.tor.kill();
-    this.emit('log', 'ShadowTor shutdown complete');
-  }
-}
-
-module.exports = ShadowTor;
-EOF
-
-# ──────────────────────────────────────────────────────────────
-# 4. index.js – FULL APP: Express + Proxy + Health
-# ──────────────────────────────────────────────────────────────
-RUN cat << 'EOF' > /app/index.js
-const express = require('express');
-const ShadowTor = require('./shadow-tor.js');
-
-const app = express();
-const PORT = process.env.PORT || 8080;
-const TARGET = process.env.TARGET || 'https://torproject.org';
-
-const shadow = new ShadowTor();
-
-shadow.on('bootstrap', p => console.log(`[SHADOW] Bootstrapped ${p}%`));
-shadow.on('ready', () => console.log('[SHADOW] Tor READY & VERIFIED'));
-shadow.on('error', err => console.error('[SHADOW] ERROR:', err.message));
-shadow.on('exit', code => console.log(`[SHADOW] Tor exited (${code})`));
-//shadow.on('log', line => console.log(`[tor] ${line}`));
-
-// Start Tor with target
-shadow.start(TARGET);
-
-// Health endpoint
-app.get('/health', (req, res) => {
-  res.json({
-    status: 'SHADOW ACTIVE',
-    tor: {
-      running: shadow.isRunning(),
-      bootstrap: `${shadow.bootstrapStatus}%`
-    },
-    proxy: `ALL PATHS → http://${TARGET}`,
-    timestamp: new Date().toISOString(),
-    note: 'Clearnet → Render → Tor → .onion'
-  }, null, 2);
-});
-
-// Catch-all: Forward EVERY path to .onion
-app.use((req, res) => {
-  shadow.forward(req, res);
-});
-
-// BIND IMMEDIATELY — RENDER SCANNER HAPPY
-app.listen(PORT, '0.0.0.0', () => {
-  console.log(`[SHADOW] Express LIVE on 0.0.0.0:${PORT} — Render port detected`);
-  console.log(`[SHADOW] Proxying ALL traffic to ${TARGET} via Tor`);
-});
-
-process.on('SIGTERM', () => {
-  shadow.shutdown();
-  process.exit(0);
-});
-EOF
-
-# ──────────────────────────────────────────────────────────────
-# 5. Expose & Run
-# ──────────────────────────────────────────────────────────────
-EXPOSE $PORT
-
-CMD ["node", "index.js"]
+# === FINAL RITUAL: START TOR + GUNICORN ===
+CMD /bin/bash -c "\
+    tor -f /etc/tor/torrc & \
+    sleep 15 && \
+    echo 'SHΔDØW: Tor daemon summoned.' && \
+    gunicorn --bind 0.0.0.0:${PORT} --workers 1 --threads 2 --timeout 120 app:app
+"
