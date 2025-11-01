@@ -1,19 +1,27 @@
 # ╔══════════════════════════════════════════════════════════╗
-# ║     SHΔDØW CORE V99 – FULL PROXY (ALL PATHS + HEALTH)    ║
-# ║        socat handles ALL traffic — Express only for /health║
+# ║     SHΔDØW CORE V99 – BULLETPROOF DOCKERFILE (FIXED)     ║
+# ║           npm install FIXED + socat FULL PROXY           ║
 # ╚══════════════════════════════════════════════════════════╝
 
 FROM node:20-alpine
 
-# Install Tor, socat, torsocks, curl, express
+# ──────────────────────────────────────────────────────────────
+# 1. Clean install: apk + npm (NO CACHE, NO CONFLICTS)
+# ──────────────────────────────────────────────────────────────
 RUN apk add --no-cache tor socat torsocks curl && \
-    npm install express && \
-    rm -rf /var/cache/apk/*
+    npm install -g npm@latest && \
+    npm config set fund false && \
+    npm config set loglevel error && \
+    mkdir -p /app && \
+    cd /app && \
+    echo '{"dependencies":{"express":"^4.19.2"}}' > package.json && \
+    npm install --omit=dev --no-audit --no-fund && \
+    rm -rf /root/.npm /var/cache/apk/*
 
 WORKDIR /app
 
 # ──────────────────────────────────────────────────────────────
-# 1. torrc
+# 2. torrc – Embedded
 # ──────────────────────────────────────────────────────────────
 RUN cat << 'EOF' > /app/torrc
 SocksPort 9050
@@ -24,7 +32,7 @@ AvoidDiskWrites 1
 EOF
 
 # ──────────────────────────────────────────────────────────────
-# 2. ShadowTor Class
+# 3. ShadowTor Class
 # ──────────────────────────────────────────────────────────────
 RUN cat << 'EOF' > /app/shadow-tor.js
 'use strict';
@@ -126,7 +134,7 @@ module.exports = ShadowTor;
 EOF
 
 # ──────────────────────────────────────────────────────────────
-# 3. Main App – ONLY /health, socat handles ALL ELSE
+# 4. Main App – Express on 127.0.0.1, socat owns public port
 # ──────────────────────────────────────────────────────────────
 RUN cat << 'EOF' > /app/index.js
 const express = require('express');
@@ -141,7 +149,7 @@ const shadow = new ShadowTor();
 shadow.on('bootstrap', p => console.log(`[SHADOW] Bootstrapped ${p}%`));
 shadow.on('ready', () => {
   console.log('[SHADOW] Tor READY & VERIFIED');
-  shadow.socat(PORT, TARGET);  // socat now owns ALL traffic
+  shadow.socat(PORT, TARGET);
   shadow.hiddenCron(2);
 });
 shadow.on('error', err => console.error('[SHADOW] ERROR:', err.message));
@@ -150,7 +158,7 @@ shadow.on('log', line => console.log(`[tor] ${line}`));
 
 shadow.start();
 
-// ONLY /health goes to Express
+// Express: ONLY /health → 127.0.0.1
 app.get('/health', (req, res) => {
   res.json({
     status: 'SHADOW ACTIVE',
@@ -164,13 +172,11 @@ app.get('/health', (req, res) => {
   }, null, 2);
 });
 
-// DO NOT add any other routes — socat handles everything
 app.listen(PORT, '127.0.0.1', () => {
   console.log(`Express health server on 127.0.0.1:${PORT}`);
-  console.log(`socat proxy owns 0.0.0.0:${PORT} → ${TARGET}`);
+  console.log(`socat owns 0.0.0.0:${PORT} → ${TARGET}`);
 });
 
-// Graceful shutdown
 process.on('SIGTERM', () => {
   shadow.shutdown();
   process.exit(0);
