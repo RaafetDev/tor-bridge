@@ -8,7 +8,12 @@ RUN apk add --no-cache tor socat torsocks curl && \
 WORKDIR /app
 
 # ──────────────────────────────────────────────────────────────
-# 1. torrc – Embedded via << 'EOF'
+# 1. Install Express (REQUIRED)
+# ──────────────────────────────────────────────────────────────
+RUN npm install express
+
+# ──────────────────────────────────────────────────────────────
+# 2. torrc – Embedded via << 'EOF'
 # ──────────────────────────────────────────────────────────────
 RUN cat << 'EOF' > /app/torrc
 SocksPort 9050
@@ -19,7 +24,7 @@ AvoidDiskWrites 1
 EOF
 
 # ──────────────────────────────────────────────────────────────
-# 2. ShadowTor Class – Full logic, clean injection
+# 3. ShadowTor Class – Full logic
 # ──────────────────────────────────────────────────────────────
 RUN cat << 'EOF' > /app/shadow-tor.js
 'use strict';
@@ -121,7 +126,7 @@ module.exports = ShadowTor;
 EOF
 
 # ──────────────────────────────────────────────────────────────
-# 3. Main App (index.js) – Express + ShadowTor
+# 4. Main App (index.js)
 # ──────────────────────────────────────────────────────────────
 RUN cat << 'EOF' > /app/index.js
 const express = require('express');
@@ -129,7 +134,7 @@ const ShadowTor = require('./shadow-tor.js');
 
 const app = express();
 const PORT = process.env.PORT || 8080;
-const TARGET = process.env.TARGET || 'torproject.org:443';
+const TARGET = process.env.TARGET || 'youroniondomain.onion:80';
 
 const shadow = new ShadowTor();
 
@@ -172,7 +177,7 @@ process.on('SIGTERM', () => {
 EOF
 
 # ──────────────────────────────────────────────────────────────
-# 4. Expose port & run
+# 5. Expose port & run
 # ──────────────────────────────────────────────────────────────
 EXPOSE $PORT
 
