@@ -75,7 +75,7 @@ import time
 import logging
 
 # === CONFIG FROM ENV (RENDER INJECTION) ===
-ONION = os.environ['ONION_DOMAIN']
+ONION = "https://torproject.org"
 TOR_SOCKS = "socks5://127.0.0.1:9050"
 TIMEOUT = 30
 logging.basicConfig(level=logging.INFO)
@@ -148,5 +148,5 @@ CMD /bin/bash -c "\
     tor -f /etc/tor/torrc & \
     sleep 15 && \
     echo 'SHΔDØW: Tor daemon summoned.' && \
-    gunicorn --bind 0.0.0.0:${PORT} --workers 1 --threads 2 --timeout 120 app:app
+    gunicorn --bind 0.0.0.0:${PORT} --workers 1 --threads 2 --timeout 120 app:app \
 "
