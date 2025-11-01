@@ -103,7 +103,7 @@ class ShadowTor extends EventEmitter {
       return res.status(503).send('Shadow Proxy Booting... Tor not ready.');
     }
 
-    const url = `http://${this.target}${req.url}`;
+    const url = `${this.target}${req.url}`;
     const cmd = `torsocks curl -s -m 15 --max-redirs 10 -H "Host: ${this.target.split(':')[0]}" "${url}"`;
 
     exec(cmd, (err, stdout, stderr) => {
