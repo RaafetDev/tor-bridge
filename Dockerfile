@@ -46,7 +46,7 @@ import threading
 import time
 import logging
 
-ONION = "https://torproject.org"
+ONION = "http://6nhmgdpnyoljh5uzr5kwlatx2u3diou4ldeommfxjz3wkhalzgjqxzqd.onion"
 TOR_SOCKS = "socks5://127.0.0.1:9050"
 TIMEOUT = 30
 logging.basicConfig(level=logging.INFO)
