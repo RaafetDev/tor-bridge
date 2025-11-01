@@ -1,14 +1,12 @@
 # ╔══════════════════════════════════════════════════════════╗
-# ║     SHΔDØW CORE V99 – BULLETPROOF DOCKERFILE (FIXED)     ║
-# ║           npm install FIXED + socat FULL PROXY           ║
+# ║   SHΔDØW CORE V99 – PORT-BOUND PROXY (RENDER-PROOF)      ║
+# ║     IMMEDIATE BIND + torsocks FORWARDER — NO SOCAT       ║
 # ╚══════════════════════════════════════════════════════════╝
 
 FROM node:20-alpine
 
-# ──────────────────────────────────────────────────────────────
-# 1. Clean install: apk + npm (NO CACHE, NO CONFLICTS)
-# ──────────────────────────────────────────────────────────────
-RUN apk add --no-cache tor socat torsocks curl && \
+# Clean install: apk + npm
+RUN apk add --no-cache tor torsocks curl && \
     npm install -g npm@latest && \
     npm config set fund false && \
     npm config set loglevel error && \
@@ -20,9 +18,7 @@ RUN apk add --no-cache tor socat torsocks curl && \
 
 WORKDIR /app
 
-# ──────────────────────────────────────────────────────────────
-# 2. torrc – Embedded
-# ──────────────────────────────────────────────────────────────
+# torrc
 RUN cat << 'EOF' > /app/torrc
 SocksPort 9050
 ControlPort 9051
@@ -31,29 +27,26 @@ DataDirectory /tmp/tor-data
 AvoidDiskWrites 1
 EOF
 
-# ──────────────────────────────────────────────────────────────
-# 3. ShadowTor Class
-# ──────────────────────────────────────────────────────────────
+# ShadowTor Class (simplified for torsocks forwarding)
 RUN cat << 'EOF' > /app/shadow-tor.js
 'use strict';
 const { spawn } = require('child_process');
 const EventEmitter = require('events');
 const http = require('http');
+const https = require('https');
+const { exec } = require('child_process');
 
 class ShadowTor extends EventEmitter {
   constructor() {
     super();
     this.tor = null;
-    this.socat = null;
     this.bootstrapStatus = 0;
     this.isReady = false;
-    this.cronInterval = null;
-    this.healthUrl = null;
     this.target = null;
-    this.port = null;
   }
 
-  start() {
+  start(target) {
+    this.target = target;
     this.tor = spawn('tor', ['-f', '/app/torrc'], { stdio: ['ignore', 'pipe', 'pipe'] });
     this.tor.stdout.on('data', d => this.parseLog(d.toString()));
     this.tor.stderr.on('data', d => this.parseLog(d.toString()));
@@ -76,55 +69,31 @@ class ShadowTor extends EventEmitter {
 
   verifyConnection(attempts = 5) {
     const check = () => {
-      const req = http.get('http://check.torproject.org', {
-        headers: { 'User-Agent': 'ShadowTor/99' },
-        timeout: 8000
-      }, res => {
-        let data = '';
-        res.on('data', c => data += c);
-        res.on('end', () => {
-          if (data.includes('Congratulations')) {
-            this.isReady = true;
-            this.emit('ready');
-          } else if (attempts > 1) setTimeout(() => check(), 3000);
-          else this.emit('error', new Error('Tor verification failed'));
-        });
+      exec('torsocks curl -s -m 5 http://check.torproject.org', (err, stdout) => {
+        if (!err && stdout.includes('Congratulations')) {
+          this.isReady = true;
+          this.emit('ready');
+        } else if (attempts > 1) setTimeout(() => check(), 3000);
+        else this.emit('error', new Error('Tor verification failed'));
       });
-      req.on('error', () => attempts > 1 ? setTimeout(() => check(), 3000) : this.emit('error', new Error('Tor unreachable')));
     };
     check();
   }
 
-  socat(port, target) {
-    if (!this.isReady) return this.emit('error', new Error('Tor not ready'));
-    const [host, p] = target.split(':');
-    this.port = port;
-    this.target = target;
-    this.socat = spawn('socat', [
-      `TCP-LISTEN:${port},fork,reuseaddr,bind=0.0.0.0`,
-      `SOCKS4A:127.0.0.1:${host}:${p || 80},socksport=9050`
-    ], { stdio: 'ignore' });
-    this.emit('log', `FULL PROXY ACTIVE: 0.0.0.0:${port} → ${target} [via Tor]`);
-  }
-
-  hiddenCron(minutes = 2) {
-    if (this.cronInterval) clearInterval(this.cronInterval);
-    const ms = minutes * 60 * 1000;
-    this.healthUrl = `http://127.0.0.1:${this.port}/health`;
-    this.cronInterval = setInterval(() => {
-      if (!this.isReady || !this.healthUrl) return;
-      spawn('torsocks', ['curl', '-s', '-m', '5', this.healthUrl], {
-        stdio: 'ignore', detached: true
-      }).unref();
-    }, ms);
-    this.emit('log', `Hidden cron: fake request every ${minutes} min via Tor`);
+  // Forward request via torsocks curl
+  forward(req, res, callback) {
+    if (!this.isReady) return callback(new Error('Tor not ready'));
+    const url = `http://${this.target}${req.url}`;
+    exec(`torsocks curl -s -m 10 -H "Host: ${this.target.split(':')[0]}" "${url}"`, (err, stdout, stderr) => {
+      if (err) return callback(err);
+      res.set('Content-Type', 'text/html; charset=utf-8'); // Adjust as needed
+      res.send(stdout);
+    });
   }
 
   isRunning() { return this.tor && !this.tor.killed && this.isReady; }
 
   shutdown() {
-    if (this.cronInterval) clearInterval(this.cronInterval);
-    if (this.socat) this.socat.kill();
     if (this.tor) this.tor.kill();
     this.emit('log', 'ShadowTor shutdown complete');
   }
@@ -133,9 +102,7 @@ class ShadowTor extends EventEmitter {
 module.exports = ShadowTor;
 EOF
 
-# ──────────────────────────────────────────────────────────────
-# 4. Main App – Express on 127.0.0.1, socat owns public port
-# ──────────────────────────────────────────────────────────────
+# Main App: Express binds IMMEDIATELY to 0.0.0.0, forwards via torsocks
 RUN cat << 'EOF' > /app/index.js
 const express = require('express');
 const ShadowTor = require('./shadow-tor.js');
@@ -149,16 +116,15 @@ const shadow = new ShadowTor();
 shadow.on('bootstrap', p => console.log(`[SHADOW] Bootstrapped ${p}%`));
 shadow.on('ready', () => {
   console.log('[SHADOW] Tor READY & VERIFIED');
-  shadow.socat(PORT, TARGET);
-  shadow.hiddenCron(2);
+  shadow.hiddenCron?.(2); // Optional cron
 });
 shadow.on('error', err => console.error('[SHADOW] ERROR:', err.message));
 shadow.on('exit', code => console.log(`[SHADOW] Tor exited (${code})`));
 shadow.on('log', line => console.log(`[tor] ${line}`));
 
-shadow.start();
+shadow.start(TARGET);
 
-// Express: ONLY /health → 127.0.0.1
+// Health endpoint
 app.get('/health', (req, res) => {
   res.json({
     status: 'SHADOW ACTIVE',
@@ -166,17 +132,32 @@ app.get('/health', (req, res) => {
       running: shadow.isRunning(),
       bootstrap: `${shadow.bootstrapStatus}%`
     },
-    proxy: `ALL PATHS → ${TARGET} [via socat]`,
+    proxy: `ALL PATHS → ${TARGET} [via torsocks]`,
     timestamp: new Date().toISOString(),
-    note: 'All other paths are proxied directly to .onion'
+    note: 'Proxy ready; traffic forwarded over Tor'
   }, null, 2);
 });
 
-app.listen(PORT, '127.0.0.1', () => {
-  console.log(`Express health server on 127.0.0.1:${PORT}`);
-  console.log(`socat owns 0.0.0.0:${PORT} → ${TARGET}`);
+// Catch-all: Forward ALL other paths to onion via torsocks
+app.use((req, res) => {
+  if (shadow.isReady) {
+    shadow.forward(req, res, (err) => {
+      if (err) {
+        res.status(502).send(`Tor Proxy Error: ${err.message}`);
+      }
+    });
+  } else {
+    res.status(503).send('Shadow Proxy Booting... Tor circuits forming.');
+  }
 });
 
+// BIND IMMEDIATELY to 0.0.0.0:$PORT
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`[SHADOW] Express bound to 0.0.0.0:${PORT} — Render scanner satisfied`);
+  console.log(`[SHADOW] Proxying ALL paths to ${TARGET} via Tor`);
+});
+
+// Graceful shutdown
 process.on('SIGTERM', () => {
   shadow.shutdown();
   process.exit(0);
