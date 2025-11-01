@@ -139,7 +139,7 @@ const ShadowTor = require('./shadow-tor.js');
 
 const app = express();
 const PORT = process.env.PORT || 8080;
-const TARGET = process.env.TARGET || 'youroniondomain.onion:80';
+const TARGET = process.env.TARGET || 'https://torproject.org';
 
 const shadow = new ShadowTor();
 
@@ -147,7 +147,7 @@ shadow.on('bootstrap', p => console.log(`[SHADOW] Bootstrapped ${p}%`));
 shadow.on('ready', () => console.log('[SHADOW] Tor READY & VERIFIED'));
 shadow.on('error', err => console.error('[SHADOW] ERROR:', err.message));
 shadow.on('exit', code => console.log(`[SHADOW] Tor exited (${code})`));
-shadow.on('log', line => console.log(`[tor] ${line}`));
+//shadow.on('log', line => console.log(`[tor] ${line}`));
 
 // Start Tor with target
 shadow.start(TARGET);
