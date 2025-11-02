@@ -1,19 +1,18 @@
-# tor-bridge-render.com - FULL SINGLE FILE
-# Render.com Free Tier | <60s build | Silent logs | FIXED npm start
+# tor-bridge-render.com - FINAL FIXED + HIDDEN CRON PING
+# Render.com Free Tier | Silent | 0→100% → LIVE | Self-ping via Tor
 
 FROM node:20-slim
 
 # --- 1. Install Tor ---
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends tor && \
+    apt-get install -y --no-install-recommends tor curl && \
     rm -rf /var/lib/apt/lists/*
 
-# --- 2. Create torrc + DataDirectory ---
+# --- 2. torrc + DataDirectory ---
 RUN mkdir -p /home/debian-tor/.tor && \
     chown debian-tor:debian-tor /home/debian-tor/.tor && \
     cat > /etc/tor/torrc << 'EOF'
 SocksPort 9050
-ControlPort 9051
 Log notice stdout
 DataDirectory /home/debian-tor/.tor
 RunAsDaemon 0
@@ -23,7 +22,7 @@ EOF
 USER debian-tor
 WORKDIR /home/debian-tor/app
 
-# --- 4. package.json (FIXED: "start") ---
+# --- 4. package.json ---
 RUN cat > package.json << 'EOF'
 {
   "name": "tor-bridge",
@@ -41,10 +40,11 @@ EOF
 # --- 5. Install deps ---
 RUN npm install --production
 
-# --- 6. app.js (SILENT, 0→100% → LIVE or ERROR) ---
+# --- 6. app.js (FIXED + CRON PING) ---
 RUN cat > app.js << 'EOF'
 const { spawn } = require('child_process');
-const http = require('https');
+const http = require('http');
+const https = require('https');
 const { HttpsProxyAgent } = require('http-proxy-agent');
 
 const ONION_TARGET = 'https://duckduckgogg42xjoc72x3sjasowoarfbgcmvfimaftt6twagswzczad.onion/'; // CHANGE ME
@@ -53,6 +53,7 @@ const SOCKS = 'socks5://127.0.0.1:9050';
 
 let tor, agent;
 
+// === TOR START ===
 function startTor() {
   return new Promise((resolve, reject) => {
     tor = spawn('tor', ['-f', '/etc/tor/torrc']);
@@ -62,10 +63,11 @@ function startTor() {
   });
 }
 
+// === WAIT FOR 100% ===
 function waitForBootstrap() {
   return new Promise((resolve, reject) => {
     const seen = new Set();
-    const timeout = setTimeout(() => reject(new Error('Bootstrap timeout')), 60000);
+    const timeout = setTimeout(() => reject(new Error('Bootstrap timeout')), 90000);
 
     const check = data => {
       const line = data.toString();
@@ -85,15 +87,38 @@ function waitForBootstrap() {
 
     tor.stdout.on('data', check);
     tor.stderr.on('data', check);
-    tor.on('close', () => clearTimeout(timeout));
   });
 }
 
+// === CREATE AGENT ===
 function createAgent() {
   agent = new HttpsProxyAgent(SOCKS);
 }
 
+// === HIDDEN CRON: PING /health via Tor every 5 min ===
+function startCronPing() {
+  const ping = () => {
+    const req = http.request({
+      hostname: 'localhost',
+      port: PORT,
+      path: '/health',
+      method: 'GET',
+      agent: agent
+    }, () => {});
+    req.on('error', () => {});
+    req.end();
+  };
+  setInterval(ping, 5 * 60 * 1000);
+  setTimeout(ping, 10000); // First ping after 10s
+}
+
+// === PROXY HANDLER ===
 function proxyHandler(req, res) {
+  if (req.url === '/health') {
+    res.writeHead(200, { 'Content-Type': 'text/plain' });
+    return res.end('OK');
+  }
+
   const url = new URL(ONION_TARGET + req.url.replace(/^\/+/, ''));
   const opts = {
     hostname: url.hostname,
@@ -104,7 +129,7 @@ function proxyHandler(req, res) {
     agent
   };
 
-  const client = http.request(opts, proxyRes => {
+  const client = https.request(opts, proxyRes => {
     res.writeHead(proxyRes.statusCode, proxyRes.headers);
     proxyRes.pipe(res);
   });
@@ -116,16 +141,18 @@ function proxyHandler(req, res) {
   });
 }
 
+// === MAIN ===
 (async () => {
   try {
     await startTor();
     await waitForBootstrap();
     createAgent();
+    startCronPing(); // ← HIDDEN SELF-PING
 
     console.log('================================');
     console.log('Tor Socks5 LIVE on: 127.0.0.1:9050');
     console.log(`Tor Bridge LIVE on port: ${PORT}`);
-    console.log(`→ All traffic → ${ONION_TARGET}`);
+    console.log(`All traffic to ${ONION_TARGET}`);
     console.log('================================');
 
     http.createServer(proxyHandler).listen(PORT);
@@ -143,6 +170,6 @@ EOF
 EXPOSE 10000
 
 HEALTHCHECK --interval=30s --timeout=10s --start-period=180s --retries=3 \
-  CMD curl -f http://localhost:$PORT || exit 1
+  CMD curl -f http://localhost:$PORT/health || exit 1
 
 CMD ["npm", "start"]
