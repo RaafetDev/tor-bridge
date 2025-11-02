@@ -1,6 +1,6 @@
-# tor-bridge-render.com - FINAL VERIFIED v4
+# tor-bridge-render.com - FINAL VERIFIED v5
 # Render.com Free Tier | Silent | 0→100% → LIVE | EXTERNAL CRON PING via Tor
-# EXPRESS + http-proxy-middleware | socks-proxy-agent (FIXED ESM) | Auto torrc
+# EXPRESS + http-proxy-middleware | socks-proxy-agent | LOCAL torrc (NO ROOT)
 
 FROM node:20-slim
 
@@ -16,7 +16,7 @@ RUN mkdir -p /home/debian-tor/.tor && \
 USER debian-tor
 WORKDIR /home/debian-tor/app
 
-# --- 3. package.json (socks-proxy-agent) ---
+# --- 3. package.json ---
 RUN cat > package.json << 'EOF'
 {
   "name": "tor-bridge-express",
@@ -37,35 +37,9 @@ EOF
 # --- 4. Install deps ---
 RUN npm install --production
 
-# --- 5. app.js (FIXED: socks-proxy-agent + SocksProxyAgent) ---
-RUN cat > app.js << 'EOF'
-const { spawn } = require('child_process');
-const express = require('express');
-const { createProxyMiddleware } = require('http-proxy-middleware');
-const { SocksProxyAgent } = require('socks-proxy-agent');
-const http = require('http');
-const https = require('https');
-
-const app = express();
-const PORT = process.env.PORT || 10000;
-
-// === RENDER EXTERNAL CONFIG ===
-const RENDER_HOSTNAME = process.env.RENDER_EXTERNAL_HOSTNAME || 'localhost';
-const RENDER_PROTOCOL = (process.env.RENDER_EXTERNAL_URL || '').startsWith('https') ? 'https' : 'http';
-const RENDER_URL = `${RENDER_PROTOCOL}://${RENDER_HOSTNAME}${PORT !== 80 && PORT !== 443 ? ':' + PORT : ''}`;
-const HEALTH_PATH = '/health';
-const FULL_HEALTH_URL = `${RENDER_URL}${HEALTH_PATH}`;
-
-// === TOR & ONION TARGET ===
-const ONION_TARGET = 'https://duckduckgogg42xjoc72x3sjasowoarfbgcmvfimaftt6twagswzczad.onion/'; // CHANGE ME
-const SOCKS_URL = 'socks5://127.0.0.1:9050';
-
-let tor, agent;
-
-// === TOR START + HARDENED torrc ===
-function startTor() {
-  return new Promise((resolve, reject) => {
-    const torrc = `
+# --- 5. app.js + LOCAL torrc (in ./etctor/torrc) ---
+RUN mkdir -p etctor && \
+    cat > etctor/torrc << 'EOF'
 SocksPort 9050
 Log notice stdout
 DataDirectory /home/debian-tor/.tor
@@ -84,11 +58,38 @@ EnforceDistinctSubnets 1
 EntryNodes {us},{ca},{nl},{de},{fr}
 ExitNodes {us},{ca},{nl},{de},{fr}
 StrictNodes 1
-`.trim();
+EOF
 
-    require('fs').writeFileSync('/etc/tor/torrc', torrc);
+RUN cat > app.js << 'EOF'
+const { spawn } = require('child_process');
+const express = require('express');
+const { createProxyMiddleware } = require('http-proxy-middleware');
+const { SocksProxyAgent } = require('socks-proxy-agent');
+const http = require('http');
+const https = require('https');
+const path = require('path');
 
-    tor = spawn('tor', ['-f', '/etc/tor/torrc']);
+const app = express();
+const PORT = process.env.PORT || 10000;
+
+// === RENDER EXTERNAL CONFIG ===
+const RENDER_HOSTNAME = process.env.RENDER_EXTERNAL_HOSTNAME || 'localhost';
+const RENDER_PROTOCOL = (process.env.RENDER_EXTERNAL_URL || '').startsWith('https') ? 'https' : 'http';
+const RENDER_URL = `${RENDER_PROTOCOL}://${RENDER_HOSTNAME}${PORT !== 80 && PORT !== 443 ? ':' + PORT : ''}`;
+const HEALTH_PATH = '/health';
+const FULL_HEALTH_URL = `${RENDER_URL}${HEALTH_PATH}`;
+
+// === TOR & ONION TARGET ===
+const ONION_TARGET = 'https://duckduckgogg42xjoc72x3sjasowoarfbgcmvfimaftt6twagswzczad.onion/'; // CHANGE ME
+const SOCKS_URL = 'socks5://127.0.0.1:9050';
+const TORRC_PATH = path.join(__dirname, 'etctor', 'torrc');
+
+let tor, agent;
+
+// === TOR START + LOCAL torrc ===
+function startTor() {
+  return new Promise((resolve, reject) => {
+    tor = spawn('tor', ['-f', TORRC_PATH]);
     tor.on('error', reject);
     tor.on('close', code => {
       if (code !== 0) reject(new Error(`Tor exited: ${code}`));
@@ -126,12 +127,12 @@ function waitForBootstrap() {
   });
 }
 
-// === CREATE SOCKS AGENT (http + https) ===
+// === CREATE SOCKS AGENT ===
 function createAgent() {
   agent = new SocksProxyAgent(SOCKS_URL);
 }
 
-// === EXTERNAL CRON PING via Tor to RENDER_EXTERNAL_HOSTNAME/health ===
+// === EXTERNAL CRON PING via Tor ===
 function startExternalCronPing() {
   const ping = () => {
     const url = new URL(FULL_HEALTH_URL);
