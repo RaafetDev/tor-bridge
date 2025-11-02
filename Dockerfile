@@ -1,5 +1,5 @@
-# tor-bridge-render.com - SHADOW CORE V106
-# SINGLE FILE | HTTPS VIA RENDER PROXY | NO TLS CRASH
+# tor-bridge-render.com - SHADOW CORE V107
+# SINGLE FILE | CSP BYPASS | FULL ONION + ASSETS
 
 FROM node:20-slim
 
@@ -29,8 +29,8 @@ WORKDIR /app
 # --- 5. package.json ---
 RUN cat > package.json << 'EOF'
 {
-  "name": "tor-bridge-v106",
-  "version": "106.0.0",
+  "name": "tor-bridge-v107",
+  "version": "107.0.0",
   "type": "module",
   "scripts": {
     "start": "node app.js"
@@ -45,7 +45,7 @@ EOF
 # --- 6. Install ---
 RUN npm install --production
 
-# --- 7. app.js — V106 (HTTP SERVER + HTTPS PROXY) ---
+# --- 7. app.js — V107 (CSP BYPASS + ASSET PROXY) ---
 RUN cat > app.js << 'EOF'
 import { spawn } from 'child_process';
 import http from 'http';
@@ -54,6 +54,7 @@ import { SocksProxyAgent } from 'socks-proxy-agent';
 
 // === CONFIG ===
 const ONION_URL = 'https://duckduckgogg42xjoc72x3sjasowoarfbgcmvfimaftt6twagswzczad.onion';
+const PROXY_HOST = 'tor-bridge.onrender.com';
 const PORT = process.env.PORT || 10000;
 const SOCKS = 'socks5h://127.0.0.1:9050';
 
@@ -84,7 +85,7 @@ function waitForBootstrap() {
         const pct = parseInt(match[1], 10);
         if (!seen.has(pct)) {
           seen.add(pct);
-          console.log(`[V106] Bootstrap: ${pct}%`);
+          console.log(`[V107] Bootstrap: ${pct}%`);
         }
         if (pct === 100) {
           clearTimeout(timeout);
@@ -119,11 +120,34 @@ function startCronPing() {
   setTimeout(ping, 15000);
 }
 
-// === PROXY HANDLER (HTTPS VIA RENDER) ===
+// === REWRITE HTML + CSP BYPASS ===
+function rewriteHTML(html) {
+  return html
+    .replace(/<head>/i, `<head>
+      <meta http-equiv="Content-Security-Policy" content="
+        default-src 'self' https: data: blob:;
+        script-src 'self' 'unsafe-inline' 'unsafe-eval' https: data: blob:;
+        style-src 'self' 'unsafe-inline' https: data:;
+        img-src 'self' data: https:;
+        font-src 'self' data: https:;
+        connect-src 'self' https:;
+        frame-src 'self' https:;
+        media-src 'self' https:;
+        object-src 'none';
+      ">
+    `)
+    .replace(/(src|href)=["']([^"']+)["']/gi, (match, attr, url) => {
+      if (url.startsWith('http') || url.startsWith('//') || url.startsWith('data:')) return match;
+      const abs = url.startsWith('/') ? `https://${PROXY_HOST}${url}` : `https://${PROXY_HOST}/${url}`;
+      return `${attr}="${abs}"`;
+    });
+}
+
+// === PROXY HANDLER (FULL ASSET PROXY + CSP) ===
 async function proxyHandler(req, res) {
   if (req.url === '/health') {
     res.writeHead(200, { 'Content-Type': 'text/plain' });
-    return res.end('V106 LIVE');
+    return res.end('V107 LIVE');
   }
 
   const path = req.url === '/' ? '' : req.url;
@@ -134,15 +158,11 @@ async function proxyHandler(req, res) {
       ...req.headers,
       host: new URL(ONION_URL).host,
       'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36',
-      'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-      'accept-language': 'en-US,en;q=0.5',
+      'accept': '*/*',
       'accept-encoding': 'gzip, deflate, br',
-      'upgrade-insecure-requests': '1',
       'sec-fetch-dest': 'document',
       'sec-fetch-mode': 'navigate',
-      'sec-fetch-site': 'none',
-      'sec-fetch-user': '?1',
-      'priority': 'u=0, i'
+      'sec-fetch-site': 'none'
     };
 
     delete headers['connection'];
@@ -166,12 +186,20 @@ async function proxyHandler(req, res) {
       }
     }
 
-    if (response.status >= 300 && response.status < 400) {
-      res.writeHead(200, { 'Content-Type': 'text/html' });
-      res.end(`<h1>Redirect Blocked</h1><p>Original: ${response.headers.get('location') || 'Unknown'}</p>`);
+    // CSP Bypass + Asset Proxy
+    if (response.headers.get('content-type')?.includes('text/html')) {
+      let html = await response.text();
+      html = rewriteHTML(html);
+      res.writeHead(response.status, {
+        ...respHeaders,
+        'content-type': 'text/html',
+        'content-security-policy': ''  // Strip original CSP
+      });
+      res.end(html);
       return;
     }
 
+    // Proxy all other assets
     res.writeHead(response.status, respHeaders);
     response.body.pipe(res);
 
@@ -185,7 +213,7 @@ async function proxyHandler(req, res) {
 // === MAIN ===
 (async () => {
   try {
-    console.log('[V106] Starting...');
+    console.log('[V107] Starting...');
     await startTor();
     await waitForBootstrap();
     createAgent();
@@ -199,8 +227,8 @@ async function proxyHandler(req, res) {
 
     server.listen(PORT, '0.0.0.0', () => {
       console.log('================================');
-      console.log('SHΔDØW CORE V106 — HTTPS VIA RENDER');
-      console.log(`Bridge: http://0.0.0.0:${PORT} (Render → HTTPS)`);
+      console.log('SHΔDØW CORE V107 — CSP BYPASS LIVE');
+      console.log(`Bridge: https://${PROXY_HOST}`);
       console.log(`Target: ${ONION_URL}`);
       console.log('================================');
     });
