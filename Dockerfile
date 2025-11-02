@@ -1,15 +1,14 @@
 # tor-bridge-render.com - FULL SINGLE FILE
-# Render.com Free Tier | <60s build | Debian tor | Silent logs
-# Only: 0→100% → LIVE or ERROR
+# Render.com Free Tier | <60s build | Silent logs | FIXED npm start
 
 FROM node:20-slim
 
-# --- 1. Install Tor (Debian package) ---
+# --- 1. Install Tor ---
 RUN apt-get update && \
     apt-get install -y --no-install-recommends tor && \
     rm -rf /var/lib/apt/lists/*
 
-# --- 2. Create torrc + safe DataDirectory ---
+# --- 2. Create torrc + DataDirectory ---
 RUN mkdir -p /home/debian-tor/.tor && \
     chown debian-tor:debian-tor /home/debian-tor/.tor && \
     cat > /etc/tor/torrc << 'EOF'
@@ -20,17 +19,19 @@ DataDirectory /home/debian-tor/.tor
 RunAsDaemon 0
 EOF
 
-# --- 3. Switch to debian-tor user ---
+# --- 3. Switch to debian-tor ---
 USER debian-tor
 WORKDIR /home/debian-tor/app
 
-# --- 4. package.json ---
+# --- 4. package.json (FIXED: "start") ---
 RUN cat > package.json << 'EOF'
 {
   "name": "tor-bridge",
   "version": "1.0.0",
   "main": "app.js",
-  "scripts": { "  start": "node app.js" },
+  "scripts": {
+    "start": "node app.js"
+  },
   "dependencies": {
     "http-proxy-agent": "^7.0.2"
   }
@@ -40,7 +41,7 @@ EOF
 # --- 5. Install deps ---
 RUN npm install --production
 
-# --- 6. app.js (SILENT, ONLY 0→100% & LIVE/ERROR) ---
+# --- 6. app.js (SILENT, 0→100% → LIVE or ERROR) ---
 RUN cat > app.js << 'EOF'
 const { spawn } = require('child_process');
 const http = require('https');
@@ -52,7 +53,6 @@ const SOCKS = 'socks5://127.0.0.1:9050';
 
 let tor, agent;
 
-// Start Tor silently
 function startTor() {
   return new Promise((resolve, reject) => {
     tor = spawn('tor', ['-f', '/etc/tor/torrc']);
@@ -62,7 +62,6 @@ function startTor() {
   });
 }
 
-// Wait for 100% bootstrap (print only 0→100%, no duplicates)
 function waitForBootstrap() {
   return new Promise((resolve, reject) => {
     const seen = new Set();
@@ -90,12 +89,10 @@ function waitForBootstrap() {
   });
 }
 
-// Create SOCKS agent
 function createAgent() {
   agent = new HttpsProxyAgent(SOCKS);
 }
 
-// Proxy all requests to .onion
 function proxyHandler(req, res) {
   const url = new URL(ONION_TARGET + req.url.replace(/^\/+/, ''));
   const opts = {
@@ -119,7 +116,6 @@ function proxyHandler(req, res) {
   });
 }
 
-// Main
 (async () => {
   try {
     await startTor();
