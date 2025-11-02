@@ -1,6 +1,6 @@
-# tor-bridge-render.com - FINAL VERIFIED v7
+# tor-bridge-render.com - FINAL VERIFIED v8
 # Render.com Free Tier | Silent | 0→100% → LIVE | EXTERNAL CRON PING via Tor
-# EXPRESS + http-proxy-middleware | socks-proxy-agent | LOCAL torrc | CLEAN URLS
+# EXPRESS + http-proxy-middleware | socks-proxy-agent | SOCKS5H (ONION DNS) | CLEAN URL
 
 FROM node:20-slim
 
@@ -37,7 +37,7 @@ EOF
 # --- 4. Install deps ---
 RUN npm install --production
 
-# --- 5. app.js + LOCAL torrc + CLEAN URL (NO PORT) ---
+# --- 5. app.js + SOCKS5H FOR .ONION DNS + TEST TARGET ---
 RUN mkdir -p etctor && \
     cat > etctor/torrc << 'EOF'
 SocksPort 9050
@@ -58,16 +58,17 @@ const path = require('path');
 const app = express();
 const PORT = process.env.PORT || 10000;
 
-// === RENDER EXTERNAL CONFIG (NO PORT IN URL) ===
+// === RENDER EXTERNAL CONFIG (NO PORT) ===
 const RENDER_HOSTNAME = process.env.RENDER_EXTERNAL_HOSTNAME || 'localhost';
 const RENDER_PROTOCOL = (process.env.RENDER_EXTERNAL_URL || '').startsWith('https') ? 'https' : 'http';
 const RENDER_BASE_URL = `${RENDER_PROTOCOL}://${RENDER_HOSTNAME}`;
 const HEALTH_PATH = '/health';
 const FULL_HEALTH_URL = `${RENDER_BASE_URL}${HEALTH_PATH}`;
 
-// === TOR & ONION TARGET ===
-const ONION_TARGET = 'https://duckduckgogg42xjoc72x3sjasowoarfbgcmvfimaftt6twagswzczad.onion/'; // CHANGE ME
-const SOCKS_URL = 'socks5://127.0.0.1:9050';
+// === TOR & ONION TARGET (TEST WITH HTTPBIN) ===
+const ONION_TARGET = 'http://httpbinorg.ipns.dweb.link/'; // TEST .ONION OVER TOR
+// const ONION_TARGET = 'https://duckduckgogg42xjoc72x3sjasowoarfbgcmvfimaftt6twagswzczad.onion/'; // UNCOMMENT WHEN LIVE
+const SOCKS_URL = 'socks5h://127.0.0.1:9050'; // ← CRITICAL: 'h' = resolve .onion via Tor
 const TORRC_PATH = path.join(__dirname, 'etctor', 'torrc');
 
 let tor, agent;
@@ -116,9 +117,9 @@ function waitForBootstrap() {
   });
 }
 
-// === CREATE SOCKS AGENT ===
+// === CREATE SOCKS AGENT WITH DNS OVER TOR ===
 function createAgent() {
-  agent = new SocksProxyAgent(SOCKS_URL);
+  agent = new SocksProxyAgent(SOCKS_URL); // 'socks5h://' → .onion DNS via Tor
 }
 
 // === EXTERNAL CRON PING via Tor (NO PORT) ===
@@ -160,7 +161,11 @@ function setupProxy() {
     on: {
       error: (err, req, res) => {
         console.log('Proxy error:', err.message);
-        res.status(502).send('Bad Gateway');
+        if (err.code === 'ENOTFOUND') {
+          res.status(502).send('Onion service unreachable or DNS failed via Tor');
+        } else {
+          res.status(502).send('Bad Gateway');
+        }
       }
     }
   };
@@ -185,7 +190,7 @@ function setupProxy() {
       console.log('Tor Web Bridge Running');
       console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
       console.log(`Server:        http://localhost:${PORT}`);
-      console.log(`Onion Service: ${ONION_TARGET.split('/')[2]}`);
+      console.log(`Onion Service: ${new URL(ONION_TARGET).host}`);
       console.log(`Base Domain:   ${RENDER_HOSTNAME}`);
       console.log(`Health Check:  ${FULL_HEALTH_URL}`);
       console.log(`External Ping: ${FULL_HEALTH_URL} (via Tor)`);
