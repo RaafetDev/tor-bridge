@@ -1,117 +1,134 @@
-# SHΔDØW CORE: ULTRA-LIGHT TOR2WEB PROXY — RENDER.COM FREE TIER
-# DEPLOY: Paste into Render > Web Service > Docker > Add Env: ONION_DOMAIN=youronion.onion
-# NO COMPILE. NO BLOAT. PURE SHADOW.
+# tor-bridge-render.com - SINGLE FILE DOCKER
+# Render.com Free Tier | <60s build | apt tor | Node.js + SOCKS5
+# All traffic → .onion via Tor | No external files | EOF-free
 
-FROM ubuntu:22.04
+FROM node:20-slim
 
-# === ENVIRONMENT: LOCKED & LOADED ===
-ENV DEBIAN_FRONTEND=noninteractive \
-    PYTHONUNBUFFERED=1 \
-    PYTHONDONTWRITEBYTECODE=1
+# --- 1. Install Tor (lightweight, fast) ---
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends tor && \
+    rm -rf /var/lib/apt/lists/* && \
+    mkdir -p /var/run/tor && \
+    chown debian-tor:debian-tor /var/run/tor
 
-# === INSTALL TOR + PYTHON + ESSENTIALS (APT = TRUTH) ===
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    tor \
-    python3 \
-    python3-pip \
-    python3-venv \
-    curl \
-    && rm -rf /var/lib/apt/lists/* \
-    && apt-get clean
+# --- 2. Copy torrc via inline HEREDOC (no external file) ---
+RUN cat > /etc/tor/torrc << 'EOF'
+SocksPort 9050
+ControlPort 9051
+Log notice stdout
+DataDirectory /var/lib/tor
+PidFile /var/run/tor/tor.pid
+RunAsDaemon 0
+EOF
 
-# === PYTHON VENV + PROXY DEPENDENCIES ===
-RUN python3 -m venv /opt/venv
-ENV PATH="/opt/venv/bin:$PATH"
-RUN pip install --no-cache-dir \
-    gunicorn \
-    flask \
-    requests[socks] \
-    stem
-
-# === TOR CONFIG: SOCKS + CONTROL + ONION RESOLUTION ===
-RUN mkdir -p /var/run/tor /var/log/tor
-RUN echo "SocksPort 9050" > /etc/tor/torrc \
-    && echo "ControlPort 9051" >> /etc/tor/torrc \
-    && echo "CookieAuthentication 1" >> /etc/tor/torrc \
-    && echo "AutomapHostsOnResolve 1" >> /etc/tor/torrc \
-    && echo "Log notice stdout" >> /etc/tor/torrc
-
-# === SHΔDØW TOR2WEB MICRO-ENGINE (PURE PYTHON, NO DISK) ===
+# --- 3. Project setup ---
 WORKDIR /app
-RUN cat > app.py << 'PYEOF'
-import os
-import requests
-from flask import Flask, request, Response
-import threading
-import time
-import logging
 
-ONION = "http://6nhmgdpnyoljh5uzr5kwlatx2u3diou4ldeommfxjz3wkhalzgjqxzqd.onion"
-TOR_SOCKS = "socks5://127.0.0.1:9050"
-TIMEOUT = 30
-logging.basicConfig(level=logging.INFO)
+# package.json (inline)
+RUN cat > package.json << 'EOF'
+{
+  "name": "tor-bridge",
+  "version": "1.0.0",
+  "main": "app.js",
+  "scripts": { "start": "node app.js" },
+  "dependencies": {
+    "socks-proxy-agent": "^8.0.4",
+    "http-proxy-agent": "^7.0.2"
+  }
+}
+EOF
 
-app = Flask(__name__)
+# Install deps
+RUN npm install --production
 
-def wait_for_tor():
-    for _ in range(60):
-        try:
-            with open('/var/run/tor/control.authcookie', 'rb') as f:
-                cookie = f.read()
-            if len(cookie) == 32:
-                logging.info("SHΔDØW: Tor control cookie ready.")
-                return
-        except:
-            time.sleep(3)
-    raise Exception("SHΔDØW: Tor failed to start.")
+# --- 4. app.js (inline, full bridge) ---
+RUN cat > app.js << 'EOF'
+const { spawn } = require('child_process');
+const net = require('net');
+const http = require('http');
+const https = require('https');
+const { SocksProxyAgent } = require('socks-proxy-agent');
+const { HttpsProxyAgent } = require('http-proxy-agent');
 
-threading.Thread(target=wait_for_tor, daemon=True).start()
+const ONION_TARGET = 'https://duckduckgogg42xjoc72x3sjasowoarfbgcmvfimaftt6twagswzczad.onion/'; // CHANGE ME
+const PORT = process.env.PORT || 10000;
+const SOCKS = 'socks5://127.0.0.1:9050';
 
-def proxy_request(path):
-    url = f"{ONION}{path}"
-    proxies = {"http": TOR_SOCKS, "https": TOR_SOCKS}
-    headers = {k: v for k, v in request.headers if k.lower() != 'host'}
-    
-    try:
-        resp = requests.request(
-            method=request.method,
-            url=url,
-            headers=headers,
-            data=request.get_data(),
-            cookies=request.cookies,
-            allow_redirects=False,
-            stream=True,
-            proxies=proxies,
-            timeout=TIMEOUT,
-            verify=False
-        )
-        headers_out = [(k, v) for k, v in resp.raw.headers.items()]
-        return Response(resp.content, resp.status_code, headers_out, direct_passthrough=True)
-    except Exception as e:
-        logging.error(f"SHΔDØW ERROR: {e}")
-        return "SHΔDØW: Onion unreachable.", 502
+let tor, agent, httpsAgent;
 
-@app.route('/', defaults={'path': ''})
-@app.route('/<path:path>')
-def catch_all(path):
-    return proxy_request('/' + path)
+function startTor() {
+  return new Promise((resolve, reject) => {
+    tor = spawn('tor', ['-f', '/etc/tor/torrc']);
+    tor.stdout.on('data', d => {
+      const out = d.toString();
+      console.log('Tor:', out);
+      if (out.includes('Bootstrapped 100%')) resolve();
+    });
+    tor.stderr.on('data', d => console.error('Tor ERR:', d.toString()));
+    tor.on('close', c => console.log('Tor exited:', c));
+  });
+}
 
-@app.route('/.shadow')
-def shadow():
-    return "SHΔDØW CORE ACTIVE", 200
+function waitForSocks() {
+  return new Promise(r => {
+    const i = setInterval(() => {
+      net.connect(9050, '127.0.0.1', () => { clearInterval(i); r(); }).on('error', () => {});
+    }, 1000);
+  });
+}
 
-if __name__ == '__main__':
-    app.run()
-PYEOF
+function createAgents() {
+  agent = new SocksProxyAgent(SOCKS);
+  httpsAgent = new HttpsProxyAgent(SOCKS);
+}
 
-# === EXPOSE RENDER PORT ===
+function proxyHandler(req, res) {
+  const url = new URL(ONION_TARGET + req.url.replace(/^\/+/, ''));
+  const opts = {
+    hostname: url.hostname,
+    port: url.port || 443,
+    path: url.pathname + url.search,
+    method: req.method,
+    headers: req.headers,
+    agent: httpsAgent
+  };
+
+  const client = https.request(opts, proxyRes => {
+    res.writeHead(proxyRes.statusCode, proxyRes.headers);
+    proxyRes.pipe(res);
+  });
+
+  req.pipe(client);
+  client.on('error', e => {
+    console.error('Proxy error:', e.message);
+    res.statusCode = 502;
+    res.end('Tor bridge error');
+  });
+}
+
+async function main() {
+  try {
+    await startTor();
+    await waitForSocks();
+    createAgents();
+    http.createServer(proxyHandler).listen(PORT, () => {
+      console.log(`Tor Bridge LIVE on port ${PORT}`);
+      console.log(`→ All traffic → ${ONION_TARGET}`);
+    });
+  } catch (e) {
+    console.error('Startup failed:', e);
+    process.exit(1);
+  }
+}
+
+main();
+process.on('SIGTERM', () => tor && tor.kill());
+EOF
+
+# --- 5. Expose & Healthcheck ---
 EXPOSE 10000
-ENV PORT=10000
 
-# === FINAL RITUAL: START TOR + GUNICORN ===
-CMD /bin/bash -c "\
-    tor -f /etc/tor/torrc & \
-    sleep 12 && \
-    echo 'SHΔDØW: Tor daemon summoned.' && \
-    gunicorn --bind 0.0.0.0:${PORT} --workers 1 --threads 2 --timeout 120 app:app --preload \
-"
+HEALTHCHECK --interval=30s --timeout=5s --start-period=90s --retries=3 \
+  CMD netstat -ln | grep -q 9050 || exit 1
+
+CMD ["npm", "start"]
