@@ -1,9 +1,10 @@
-# tor-bridge-render.com - FINAL FIXED + HIDDEN CRON PING
-# Render.com Free Tier | Silent | 0→100% → LIVE | Self-ping via Tor
+# tor-bridge-render.com - FINAL VERIFIED
+# Render.com Free Tier | Silent | 0→100% → LIVE | Cron Ping
+# FIXED: HttpsProxyAgent import (v7+ ESM)
 
 FROM node:20-slim
 
-# --- 1. Install Tor ---
+# --- 1. Install Tor + curl (for healthcheck) ---
 RUN apt-get update && \
     apt-get install -y --no-install-recommends tor curl && \
     rm -rf /var/lib/apt/lists/*
@@ -40,12 +41,14 @@ EOF
 # --- 5. Install deps ---
 RUN npm install --production
 
-# --- 6. app.js (FIXED + CRON PING) ---
+# --- 6. app.js (FIXED IMPORT + CRON PING) ---
 RUN cat > app.js << 'EOF'
 const { spawn } = require('child_process');
 const http = require('http');
 const https = require('https');
-const { HttpsProxyAgent } = require('http-proxy-agent');
+
+// CORRECT IMPORT FOR v7+
+const { HttpsProxyAgent } = require('http-proxy-agent').default;
 
 const ONION_TARGET = 'https://duckduckgogg42xjoc72x3sjasowoarfbgcmvfimaftt6twagswzczad.onion/'; // CHANGE ME
 const PORT = process.env.PORT || 10000;
@@ -109,7 +112,7 @@ function startCronPing() {
     req.end();
   };
   setInterval(ping, 5 * 60 * 1000);
-  setTimeout(ping, 10000); // First ping after 10s
+  setTimeout(ping, 10000);
 }
 
 // === PROXY HANDLER ===
@@ -147,7 +150,7 @@ function proxyHandler(req, res) {
     await startTor();
     await waitForBootstrap();
     createAgent();
-    startCronPing(); // ← HIDDEN SELF-PING
+    startCronPing();
 
     console.log('================================');
     console.log('Tor Socks5 LIVE on: 127.0.0.1:9050');
