@@ -1,5 +1,5 @@
-# tor-bridge-render.com - SHADOW CORE V99 EDITION
-# ESM-SAFE | RENDER.COM FREE TIER | 0→100% BOOTSTRAP | CRON ALIVE
+# tor-bridge-render.com - SHADOW CORE V99.1
+# ESM-SAFE | SYNTAX-PERFECT | RENDER.COM FREE TIER | 0→100%
 
 FROM node:20-slim
 
@@ -24,11 +24,11 @@ EOF
 USER debian-tor
 WORKDIR /home/debian-tor/app
 
-# --- 4. package.json (type: module for ESM) ---
+# --- 4. package.json (ESM MODE) ---
 RUN cat > package.json << 'EOF'
 {
   "name": "tor-bridge-shadow",
-  "version": "99.0.0",
+  "version": "99.1.0",
   "type": "module",
   "main": "app.js",
   "scripts": {
@@ -43,14 +43,13 @@ EOF
 # --- 5. Install deps ---
 RUN npm install --production
 
-# --- 6. app.js — FULL ESM + DYNAMIC IMPORT + CRON + HEALTH ---
+# --- 6. app.js — ESM + DYNAMIC IMPORT + SYNTAX FIXED ---
 RUN cat > app.js << 'EOF'
 import { spawn } from 'child_process';
 import http from 'http';
 import https from 'https';
-import { fileURLToPath } from 'url';
 
-// === DYNAMIC ESM IMPORT (100% SAFE) ===
+// === DYNAMIC ESM IMPORT ===
 const { HttpsProxyAgent } = await import('http-proxy-agent');
 
 const ONION_TARGET = 'https://duckduckgogg42xjoc72x3sjasowoarfbgcmvfimaftt6twagswzczad.onion/';
@@ -105,7 +104,7 @@ async function createAgent() {
   agent = new HttpsProxyAgent(SOCKS);
 }
 
-// === CRON PING (RENDER ALIVE) ===
+// === CRON PING ===
 function startCronPing() {
   const ping = () => {
     const req = http.request({
@@ -118,15 +117,15 @@ function startCronPing() {
     req.on('error', () => {});
     req.end();
   };
-  setInterval(ping, 4 * 60 * 1000); // Every 4 min
-  setTimeout(ping, 15000); // First ping after 15s
+  setInterval(ping, 4 * 60 * 1000);
+  setTimeout(ping, 15000);
 }
 
 // === PROXY CORE ===
 function proxyHandler(req, res) {
   if (req.url === '/health') {
     res.writeHead(200, { 'Content-Type': 'text/plain', 'Cache-Control': 'no-cache' });
-    return res.end('SHADOW CORE V99 — LIVE');
+    return res.end('SHADOW CORE V99.1 — LIVE');
   }
 
   try {
@@ -136,7 +135,7 @@ function proxyHandler(req, res) {
       port: target.port || 443,
       path: target.pathname + target.search,
       method: req.method,
-      headers: { ...req.headers, host (req.headers.host) },
+      headers: { ...req.headers, host: req.headers.host },  // ← FIXED
       agent
     };
 
@@ -149,9 +148,7 @@ function proxyHandler(req, res) {
 
     client.on('error', err => {
       console.error('[PROXY ERROR]', err.message);
-      if (!res.headersSent) {
-        res.writeHead(502, { 'Content-Type': 'text/plain' });
-      }
+      if (!res.headersSent) res.writeHead(502);
       res.end('Bad Gateway');
     });
   } catch (err) {
@@ -163,7 +160,7 @@ function proxyHandler(req, res) {
 // === SHADOW MAIN ===
 (async () => {
   try {
-    console.log('[SHADOW CORE V99] Initializing...');
+    console.log('[SHADOW CORE V99.1] Initializing...');
     await startTor();
     await waitForBootstrap();
     await createAgent();
@@ -172,7 +169,7 @@ function proxyHandler(req, res) {
     const server = http.createServer(proxyHandler);
     server.listen(PORT, () => {
       console.log('=====================================');
-      console.log('SHΔDØW CORE V99 — FULLY OPERATIONAL');
+      console.log('SHΔDØW CORE V99.1 — FULLY OPERATIONAL');
       console.log(`Tor Socks5: 127.0.0.1:9050`);
       console.log(`Bridge LIVE: http://0.0.0.0:${PORT}`);
       console.log(`Target: ${ONION_TARGET}`);
@@ -194,7 +191,7 @@ function proxyHandler(req, res) {
 })();
 EOF
 
-# --- 7. Expose + Healthcheck (Render Native) ---
+# --- 7. Expose + Healthcheck ---
 EXPOSE 10000
 
 HEALTHCHECK --interval=30s --timeout=10s --start-period=200s --retries=5 \
