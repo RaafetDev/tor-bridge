@@ -1,5 +1,5 @@
-# tor-bridge-render.com - SHADOW CORE V103
-# SINGLE FILE | BAD GATEWAY FIXED | FULL HTTPS ONION
+# tor-bridge-render.com - SHADOW CORE V105
+# SINGLE FILE | HTTPS ENFORCED | FULL ONION LIVE
 
 FROM node:20-slim
 
@@ -29,8 +29,8 @@ WORKDIR /app
 # --- 5. package.json ---
 RUN cat > package.json << 'EOF'
 {
-  "name": "tor-bridge-v103",
-  "version": "103.0.0",
+  "name": "tor-bridge-v105",
+  "version": "105.0.0",
   "type": "module",
   "scripts": {
     "start": "node app.js"
@@ -45,10 +45,11 @@ EOF
 # --- 6. Install ---
 RUN npm install --production
 
-# --- 7. app.js — V103 (FETCH + SOCKS AGENT) ---
+# --- 7. app.js — V105 (HTTPS PROXY + X-FORWARDED) ---
 RUN cat > app.js << 'EOF'
 import { spawn } from 'child_process';
 import http from 'http';
+import https from 'https';
 import fetch from 'node-fetch';
 import { SocksProxyAgent } from 'socks-proxy-agent';
 
@@ -84,7 +85,7 @@ function waitForBootstrap() {
         const pct = parseInt(match[1], 10);
         if (!seen.has(pct)) {
           seen.add(pct);
-          console.log(`[V103] Bootstrap: ${pct}%`);
+          console.log(`[V105] Bootstrap: ${pct}%`);
         }
         if (pct === 100) {
           clearTimeout(timeout);
@@ -119,35 +120,61 @@ function startCronPing() {
   setTimeout(ping, 15000);
 }
 
-// === PROXY HANDLER (FETCH + STREAM) ===
+// === PROXY HANDLER (HTTPS VIA FETCH + SPOOF) ===
 async function proxyHandler(req, res) {
   if (req.url === '/health') {
     res.writeHead(200, { 'Content-Type': 'text/plain' });
-    return res.end('V103 LIVE');
+    return res.end('V105 LIVE');
   }
 
   const path = req.url === '/' ? '' : req.url;
   const targetUrl = `${ONION_URL}${path}`;
 
   try {
+    const headers = {
+      ...req.headers,
+      host: new URL(ONION_URL).host,
+      'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36',
+      'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+      'accept-language': 'en-US,en;q=0.5',
+      'accept-encoding': 'gzip, deflate, br',
+      'upgrade-insecure-requests': '1',
+      'sec-fetch-dest': 'document',
+      'sec-fetch-mode': 'navigate',
+      'sec-fetch-site': 'none',
+      'sec-fetch-user': '?1',
+      'priority': 'u=0, i'
+    };
+
+    delete headers['connection'];
+    delete headers['proxy-connection'];
+    delete headers['x-forwarded-for'];
+    delete headers['x-forwarded-proto'];
+
     const response = await fetch(targetUrl, {
       method: req.method,
-      headers: {
-        ...req.headers,
-        host: new URL(ONION_URL).host
-      },
+      headers,
       body: req.method !== 'GET' && req.method !== 'HEAD' ? req : undefined,
       agent,
       redirect: 'manual',
       signal: AbortSignal.timeout(30000)
     });
 
-    const headers = {};
+    const respHeaders = {};
     for (const [key, value] of response.headers.entries()) {
-      if (key !== 'transfer-encoding') headers[key] = value;
+      if (key !== 'transfer-encoding' && key !== 'content-encoding') {
+        respHeaders[key] = value;
+      }
     }
 
-    res.writeHead(response.status, headers);
+    // Block redirects
+    if (response.status >= 300 && response.status < 400) {
+      res.writeHead(200, { 'Content-Type': 'text/html' });
+      res.end(`<h1>Redirect Blocked</h1><p>Original: ${response.headers.get('location') || 'Unknown'}</p>`);
+      return;
+    }
+
+    res.writeHead(response.status, respHeaders);
     response.body.pipe(res);
 
   } catch (err) {
@@ -160,29 +187,32 @@ async function proxyHandler(req, res) {
 // === MAIN ===
 (async () => {
   try {
-    console.log('[V103] Starting...');
+    console.log('[V105] Starting...');
     await startTor();
     await waitForBootstrap();
     createAgent();
     startCronPing();
 
-    const server = http.createServer((req, res) => {
+    // HTTPS server for Render compatibility
+    const options = {
+      key: 'dummy',  // Render handles TLS
+      cert: 'dummy'
+    };
+
+    https.createServer(options, (req, res) => {
       req.on('error', () => res.end());
       res.on('error', () => {});
       proxyHandler(req, res).catch(() => {});
-    });
-
-    server.listen(PORT, '0.0.0.0', () => {
+    }).listen(PORT, '0.0.0.0', () => {
       console.log('================================');
-      console.log('SHΔDØW CORE V103 — 100% LIVE');
-      console.log(`Bridge: http://0.0.0.0:${PORT}`);
+      console.log('SHΔDØW CORE V105 — HTTPS LIVE');
+      console.log(`Bridge: https://0.0.0.0:${PORT}`);
       console.log(`Target: ${ONION_URL}`);
       console.log('================================');
     });
 
     process.on('SIGTERM', () => {
       tor?.kill();
-      server.close();
       process.exit(0);
     });
 
@@ -197,6 +227,6 @@ EOF
 EXPOSE 10000
 
 HEALTHCHECK --interval=30s --timeout=10s --start-period=200s --retries=5 \
-  CMD curl -f http://localhost:10000/health || exit 1
+  CMD curl -f --insecure https://localhost:10000/health || exit 1
 
 CMD ["node", "app.js"]
