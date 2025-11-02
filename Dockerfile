@@ -1,6 +1,6 @@
-# tor-bridge-render.com - FINAL VERIFIED v6
+# tor-bridge-render.com - FINAL VERIFIED v7
 # Render.com Free Tier | Silent | 0→100% → LIVE | EXTERNAL CRON PING via Tor
-# EXPRESS + http-proxy-middleware | socks-proxy-agent | LOCAL torrc (FAST & STABLE)
+# EXPRESS + http-proxy-middleware | socks-proxy-agent | LOCAL torrc | CLEAN URLS
 
 FROM node:20-slim
 
@@ -37,7 +37,7 @@ EOF
 # --- 4. Install deps ---
 RUN npm install --production
 
-# --- 5. app.js + LOCAL torrc (FAST BOOTSTRAP, NO CRASH) ---
+# --- 5. app.js + LOCAL torrc + CLEAN URL (NO PORT) ---
 RUN mkdir -p etctor && \
     cat > etctor/torrc << 'EOF'
 SocksPort 9050
@@ -58,12 +58,12 @@ const path = require('path');
 const app = express();
 const PORT = process.env.PORT || 10000;
 
-// === RENDER EXTERNAL CONFIG ===
+// === RENDER EXTERNAL CONFIG (NO PORT IN URL) ===
 const RENDER_HOSTNAME = process.env.RENDER_EXTERNAL_HOSTNAME || 'localhost';
 const RENDER_PROTOCOL = (process.env.RENDER_EXTERNAL_URL || '').startsWith('https') ? 'https' : 'http';
-const RENDER_URL = `${RENDER_PROTOCOL}://${RENDER_HOSTNAME}${PORT !== 80 && PORT !== 443 ? ':' + PORT : ''}`;
+const RENDER_BASE_URL = `${RENDER_PROTOCOL}://${RENDER_HOSTNAME}`;
 const HEALTH_PATH = '/health';
-const FULL_HEALTH_URL = `${RENDER_URL}${HEALTH_PATH}`;
+const FULL_HEALTH_URL = `${RENDER_BASE_URL}${HEALTH_PATH}`;
 
 // === TOR & ONION TARGET ===
 const ONION_TARGET = 'https://duckduckgogg42xjoc72x3sjasowoarfbgcmvfimaftt6twagswzczad.onion/'; // CHANGE ME
@@ -72,7 +72,7 @@ const TORRC_PATH = path.join(__dirname, 'etctor', 'torrc');
 
 let tor, agent;
 
-// === TOR START + MINIMAL torrc (FAST & STABLE) ===
+// === TOR START + MINIMAL torrc ===
 function startTor() {
   return new Promise((resolve, reject) => {
     tor = spawn('tor', ['-f', TORRC_PATH]);
@@ -90,7 +90,7 @@ function waitForBootstrap() {
     let lastPct = -1;
     const timeout = setTimeout(() => {
       console.log('Bootstrap timeout reached. Continuing anyway...');
-      resolve(); // Continue even if not 100%
+      resolve();
     }, 90000);
 
     const check = data => {
@@ -121,7 +121,7 @@ function createAgent() {
   agent = new SocksProxyAgent(SOCKS_URL);
 }
 
-// === EXTERNAL CRON PING via Tor ===
+// === EXTERNAL CRON PING via Tor (NO PORT) ===
 function startExternalCronPing() {
   const ping = () => {
     const url = new URL(FULL_HEALTH_URL);
@@ -159,7 +159,8 @@ function setupProxy() {
     logLevel: 'silent',
     on: {
       error: (err, req, res) => {
-        res.status(502).send();
+        console.log('Proxy error:', err.message);
+        res.status(502).send('Bad Gateway');
       }
     }
   };
