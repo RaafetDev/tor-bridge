@@ -1,5 +1,5 @@
-# tor-bridge-render.com - SHADOW CORE V101
-# SINGLE FILE | 502 FIXED | RENDER.COM LIVE
+# tor-bridge-render.com - SHADOW CORE V102
+# SINGLE FILE | 400/502 FIXED | HTTPS ONION VIA CONNECT
 
 FROM node:20-slim
 
@@ -29,8 +29,8 @@ WORKDIR /app
 # --- 5. package.json ---
 RUN cat > package.json << 'EOF'
 {
-  "name": "tor-bridge-v101",
-  "version": "101.0.0",
+  "name": "tor-bridge-v102",
+  "version": "102.0.0",
   "type": "module",
   "scripts": {
     "start": "node app.js"
@@ -44,16 +44,17 @@ EOF
 # --- 6. Install ---
 RUN npm install --production
 
-# --- 7. app.js — V101 (HTTP over SOCKS + 502 FIX) ---
+# --- 7. app.js — V102 (CONNECT TUNNEL + HTTPS ONION) ---
 RUN cat > app.js << 'EOF'
 import { spawn } from 'child_process';
 import http from 'http';
 import { SocksProxyAgent } from 'socks-proxy-agent';
+import { URL } from 'url';
 
 // === CONFIG ===
 const ONION_HOST = 'duckduckgogg42xjoc72x3sjasowoarfbgcmvfimaftt6twagswzczad.onion';
 const PORT = process.env.PORT || 10000;
-const SOCKS = 'socks5h://127.0.0.1:9050';  // DNS over Tor
+const SOCKS = 'socks5h://127.0.0.1:9050';
 
 let tor, agent;
 
@@ -82,7 +83,7 @@ function waitForBootstrap() {
         const pct = parseInt(match[1], 10);
         if (!seen.has(pct)) {
           seen.add(pct);
-          console.log(`[V101] Bootstrap: ${pct}%`);
+          console.log(`[V102] Bootstrap: ${pct}%`);
         }
         if (pct === 100) {
           clearTimeout(timeout);
@@ -117,53 +118,108 @@ function startCronPing() {
   setTimeout(ping, 15000);
 }
 
-// === PROXY HANDLER (HTTP over Tor → HTTPS onion) ===
+// === PROXY HANDLER (CONNECT + HTTPS) ===
 function proxyHandler(req, res) {
   if (req.url === '/health') {
     res.writeHead(200, { 'Content-Type': 'text/plain' });
-    return res.end('V101 LIVE');
+    return res.end('V102 LIVE');
   }
 
-  const path = req.url.replace(/^\/+/, '');
+  const path = req.url.replace(/^\/+/, '') || '/';
+  const target = `https://${ONION_HOST}/${path}`;
+
+  const url = new URL(target);
   const opts = {
-    hostname: ONION_HOST,
-    port: 443,
-    path: '/' + path,
-    method: req.method,
-    headers: { ...req.headers, host: ONION_HOST },
+    method: 'CONNECT',
+    path: `${url.hostname}:443`,
     agent,
-    createConnection: agent.createConnection  // Force SOCKS
+    headers: { host: url.hostname }
   };
 
-  const client = http.request(opts, proxyRes => {
-    res.writeHead(proxyRes.statusCode, proxyRes.headers);
-    proxyRes.pipe(res);
+  const connectReq = http.request(opts);
+
+  connectReq.on('connect', (proxyRes, socket) => {
+    if (proxyRes.statusCode !== 200) {
+      res.writeHead(502);
+      return res.end('Tunnel failed');
+    }
+
+    // Now send HTTPS request over tunnel
+    const httpsReq = [
+      `${req.method} ${url.pathname}${url.search} HTTP/1.1`,
+      `Host: ${url.hostname}`,
+      'Connection: close',
+      ...Object.entries(req.headers)
+        .filter(([k]) => !['host', 'connection'].includes(k.toLowerCase()))
+        .map(([k, v]) => `${k}: ${v}`),
+      '',
+      ''
+    ].join('\r\n');
+
+    socket.write(httpsReq);
+
+    // Pipe body
+    req.pipe(socket);
+
+    // Pipe response
+    let response = '';
+    socket.on('data', chunk => {
+      response += chunk.toString();
+      const headersEnd = response.indexOf('\r\n\r\n');
+      if (headersEnd !== -1 && !res.headersSent) {
+        const headerPart = response.slice(0, headersEnd);
+        const bodyPart = response.slice(headersEnd + 4);
+        const statusLine = headerPart.split('\r\n')[0];
+        const statusMatch = statusLine.match(/HTTP\/1\.[01]\s+(\d+)/);
+        const status = statusMatch ? parseInt(statusMatch[1]) : 502;
+        const headers = {};
+        headerPart.split('\r\n').slice(1).forEach(line => {
+          const [k, v] = line.split(': ');
+          if (k && v) headers[k.toLowerCase()] = v;
+        });
+        delete headers['transfer-encoding'];
+        res.writeHead(status, headers);
+        res.write(bodyPart);
+      } else if (res.headersSent) {
+        res.write(chunk);
+      }
+    });
+
+    socket.on('end', () => res.end());
+    socket.on('error', () => {
+      if (!res.headersSent) res.writeHead(502);
+      res.end();
+    });
   });
 
-  req.pipe(client);
-
-  client.on('error', err => {
-    console.error('[PROXY ERROR]', err.message);
+  connectReq.on('error', () => {
     if (!res.headersSent) res.writeHead(502);
     res.end('Bad Gateway');
   });
+
+  connectReq.end();
 }
 
 // === MAIN ===
 (async () => {
   try {
-    console.log('[V101] Starting...');
+    console.log('[V102] Starting...');
     await startTor();
     await waitForBootstrap();
     createAgent();
     startCronPing();
 
-    const server = http.createServer(proxyHandler);
+    const server = http.createServer((req, res) => {
+      req.on('error', () => res.end());
+      res.on('error', () => {});
+      proxyHandler(req, res);
+    });
+
     server.listen(PORT, '0.0.0.0', () => {
       console.log('================================');
-      console.log('SHΔDØW CORE V101 — 100% LIVE');
+      console.log('SHΔDØW CORE V102 — 100% LIVE');
       console.log(`Bridge: http://0.0.0.0:${PORT}`);
-      console.log(`Target: http://${ONION_HOST}/`);
+      console.log(`Target: https://${ONION_HOST}/`);
       console.log('================================');
     });
 
