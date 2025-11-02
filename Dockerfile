@@ -1,8 +1,8 @@
-# tor-bridge-render.com - SOLID ONION BRIDGE v2.2
+# tor-bridge-render.com - SOLID ONION BRIDGE v2.3
 # FULL STANDALONE DOCKERFILE | Render.com Free Tier
-# MINIMAL: tor + curl | NO ca-certificates | NO chown | NO mkdir
-# TORRC GENERATED AT RUNTIME IN APP DIR → ./torconfig
-# FAST BOOTSTRAP | http-proxy | ESM | CRON | HEALTHCHECK
+# FIXED: SyntaxError in multi-line echo → ESCAPED NEWLINES
+# MINIMAL: tor + curl | RUNTIME torconfig | FAST BOOTSTRAP
+# http-proxy | ESM | CRON | HEALTHCHECK | ZERO FAIL
 
 FROM node:20-slim
 
@@ -18,7 +18,7 @@ WORKDIR /home/debian-tor/app
 # === package.json (ESM + DEPENDENCIES) ===
 RUN echo '{ \
   "name": "solid-tor-onion-bridge", \
-  "version": "2.2.0", \
+  "version": "2.3.0", \
   "main": "app.js", \
   "type": "module", \
   "scripts": { \
@@ -33,7 +33,7 @@ RUN echo '{ \
 # === INSTALL NODE DEPENDENCIES ===
 RUN npm install --production
 
-# === app.js → FAST BOOTSTRAP + RUNTIME torconfig ===
+# === app.js → FIXED: PROPERLY ESCAPED MULTI-LINE STRING ===
 RUN echo "import { createServer } from 'http';\n\
 import httpProxy from 'http-proxy';\n\
 import { HttpsProxyAgent } from 'http-proxy-agent';\n\
@@ -49,7 +49,7 @@ const TORRC_PATH = resolve(process.cwd(), 'torconfig');\n\
 \n\
 let tor, proxy, agent;\n\
 \n\
-// === RUNTIME TORRC GENERATION (FAST) ===\n\
+// === RUNTIME TORRC GENERATION ===\n\
 function generateTorrc() {\n\
   const torrc = [\n\
     'SocksPort 9050',\n\
@@ -63,17 +63,20 @@ function generateTorrc() {\n\
   console.log('[TORRC] Generated at:', TORRC_PATH);\n\
 }\n\
 \n\
-// === TOR LAUNCH & FAST BOOTSTRAP ===\n\
+// === TOR LAUNCH ===\n\
 async function startTor() {\n\
   return new Promise((resolve, reject) => {\n\
     generateTorrc();\n\
     tor = spawn('tor', ['-f', TORRC_PATH]);\n\
     tor.on('error', reject);\n\
-    tor.on('close', code => code !== 0 && reject(new Error(`Tor exited: ${code}`)));\n\
+    tor.on('close', code => {\n\
+      if (code !== 0) reject(new Error(\`Tor exited: \${code}\`));\n\
+    });\n\
     resolve();\n\
   });\n\
 }\n\
 \n\
+// === FAST BOOTSTRAP ===\n\
 async function waitForBootstrap() {\n\
   return new Promise((resolve, reject) => {\n\
     const seen = new Set();\n\
@@ -86,7 +89,7 @@ async function waitForBootstrap() {\n\
         const pct = parseInt(match[1], 10);\n\
         if (!seen.has(pct)) {\n\
           seen.add(pct);\n\
-          console.log(`[TOR] Bootstrapped: ${pct}%`);\n\
+          console.log(\`[TOR] Bootstrapped: \${pct}%\`);\n\
         }\n\
         if (pct === 100) {\n\
           clearTimeout(timeout);\n\
@@ -100,7 +103,7 @@ async function waitForBootstrap() {\n\
   });\n\
 }\n\
 \n\
-// === PROXY ENGINE (http-proxy) ===\n\
+// === PROXY ENGINE ===\n\
 function createProxy() {\n\
   agent = new HttpsProxyAgent(SOCKS);\n\
   proxy = httpProxy.createProxyServer({\n\
@@ -125,9 +128,14 @@ function createProxy() {\n\
 // === CRON PING (KEEP ALIVE) ===\n\
 function startCronPing() {\n\
   const ping = () => {\n\
-    fetch(`http://localhost:${PORT}/health`, { signal: AbortSignal.timeout(5000) })\n\
-      .then(() => console.log('[CRON] Health OK'))\n\
-      .catch(() => {});\n\
+    const req = http.request({\n\
+      hostname: 'localhost',\n\
+      port: PORT,\n\
+      path: '/health',\n\
+      method: 'GET'\n\
+    }, () => {});\n\
+    req.on('error', () => {});\n\
+    req.end();\n\
   };\n\
   setInterval(ping, 4 * 60 * 1000);\n\
   setTimeout(ping, 15000);\n\
@@ -145,10 +153,10 @@ function startServer() {\n\
 \n\
   server.listen(PORT, () => {\n\
     console.log('================================');\n\
-    console.log('SOLID TOR BRIDGE v2.2 LIVE');\n\
-    console.log(`Port: ${PORT}`);\n\
-    console.log(`SOCKS: 127.0.0.1:9050`);\n\
-    console.log(`Target: ${ONION_TARGET}`);\n\
+    console.log('SOLID TOR BRIDGE v2.3 LIVE');\n\
+    console.log(\`Port: \${PORT}\`);\n\
+    console.log('SOCKS: 127.0.0.1:9050');\n\
+    console.log(\`Target: \${ONION_TARGET}\`);\n\
     console.log('================================');\n\
   });\n\
 }\n\
