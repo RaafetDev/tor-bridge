@@ -1,6 +1,6 @@
-# tor-bridge-render.com - FINAL VERIFIED v3
+# tor-bridge-render.com - FINAL VERIFIED v4
 # Render.com Free Tier | Silent | 0→100% → LIVE | EXTERNAL CRON PING via Tor
-# EXPRESS + http-proxy-middleware | Auto torrc | EXTERNAL_HOSTNAME PING
+# EXPRESS + http-proxy-middleware | socks-proxy-agent (FIXED ESM) | Auto torrc
 
 FROM node:20-slim
 
@@ -16,19 +16,20 @@ RUN mkdir -p /home/debian-tor/.tor && \
 USER debian-tor
 WORKDIR /home/debian-tor/app
 
-# --- 3. package.json ---
+# --- 3. package.json (socks-proxy-agent) ---
 RUN cat > package.json << 'EOF'
 {
   "name": "tor-bridge-express",
   "version": "1.0.0",
   "main": "app.js",
+  "type": "commonjs",
   "scripts": {
     "start": "node app.js"
   },
   "dependencies": {
     "express": "^4.21.1",
     "http-proxy-middleware": "^3.0.3",
-    "http-proxy-agent": "^7.0.2"
+    "socks-proxy-agent": "^8.0.4"
   }
 }
 EOF
@@ -36,27 +37,28 @@ EOF
 # --- 4. Install deps ---
 RUN npm install --production
 
-# --- 5. app.js (EXTERNAL CRON PING via Tor + RENDER_EXTERNAL_HOSTNAME) ---
+# --- 5. app.js (FIXED: socks-proxy-agent + SocksProxyAgent) ---
 RUN cat > app.js << 'EOF'
 const { spawn } = require('child_process');
 const express = require('express');
 const { createProxyMiddleware } = require('http-proxy-middleware');
-const { HttpsProxyAgent } = require('http-proxy-agent').default;
+const { SocksProxyAgent } = require('socks-proxy-agent');
 const http = require('http');
+const https = require('https');
 
 const app = express();
 const PORT = process.env.PORT || 10000;
 
 // === RENDER EXTERNAL CONFIG ===
 const RENDER_HOSTNAME = process.env.RENDER_EXTERNAL_HOSTNAME || 'localhost';
-const RENDER_PROTOCOL = process.env.RENDER_EXTERNAL_URL?.startsWith('https') ? 'https' : 'http';
-const RENDER_URL = `${RENDER_PROTOCOL}://${RENDER_HOSTNAME}:${PORT}`;
+const RENDER_PROTOCOL = (process.env.RENDER_EXTERNAL_URL || '').startsWith('https') ? 'https' : 'http';
+const RENDER_URL = `${RENDER_PROTOCOL}://${RENDER_HOSTNAME}${PORT !== 80 && PORT !== 443 ? ':' + PORT : ''}`;
 const HEALTH_PATH = '/health';
 const FULL_HEALTH_URL = `${RENDER_URL}${HEALTH_PATH}`;
 
 // === TOR & ONION TARGET ===
 const ONION_TARGET = 'https://duckduckgogg42xjoc72x3sjasowoarfbgcmvfimaftt6twagswzczad.onion/'; // CHANGE ME
-const SOCKS = 'socks5://127.0.0.1:9050';
+const SOCKS_URL = 'socks5://127.0.0.1:9050';
 
 let tor, agent;
 
@@ -109,7 +111,7 @@ function waitForBootstrap() {
         if (pct > lastPct && pct % 10 === 0) {
           lastPct = pct;
           console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
-          console.log(`🔄 Tor Bootstraped: ${pct}%`);
+          console.log(`Tor Bootstraped: ${pct}%`);
           console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
         }
         if (pct === 100) {
@@ -124,18 +126,19 @@ function waitForBootstrap() {
   });
 }
 
-// === CREATE TOR PROXY AGENT ===
+// === CREATE SOCKS AGENT (http + https) ===
 function createAgent() {
-  agent = new HttpsProxyAgent(SOCKS);
+  agent = new SocksProxyAgent(SOCKS_URL);
 }
 
 // === EXTERNAL CRON PING via Tor to RENDER_EXTERNAL_HOSTNAME/health ===
 function startExternalCronPing() {
   const ping = () => {
     const url = new URL(FULL_HEALTH_URL);
+    const client = url.protocol === 'https:' ? https : http;
     const options = {
       hostname: url.hostname,
-      port: url.port || (RENDER_PROTOCOL === 'https' ? 443 : 80),
+      port: url.port || (url.protocol === 'https:' ? 443 : 80),
       path: url.pathname + url.search,
       method: 'GET',
       agent: agent,
@@ -146,12 +149,11 @@ function startExternalCronPing() {
       }
     };
 
-    const client = (RENDER_PROTOCOL === 'https' ? require('https') : http).request(options, () => {});
-    client.on('error', () => {});
-    client.end();
+    const req = client.request(options, () => {});
+    req.on('error', () => {});
+    req.end();
   };
 
-  // First ping after 15s, then every 5 min
   setTimeout(ping, 15000);
   setInterval(ping, 5 * 60 * 1000);
 }
@@ -189,13 +191,13 @@ function setupProxy() {
 
     app.listen(PORT, () => {
       console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
-      console.log('🚀 Tor Web Bridge Running');
+      console.log('Tor Web Bridge Running');
       console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
-      console.log(`📍 Server:        http://localhost:${PORT}`);
-      console.log(`🧅 Onion Service: ${ONION_TARGET.split('/')[2]}`);
-      console.log(`🌐 Base Domain:   ${RENDER_HOSTNAME}`);
-      console.log(`💚 Health Check:  ${FULL_HEALTH_URL}`);
-      console.log(`🔄 External Ping: ${FULL_HEALTH_URL} (via Tor)`);
+      console.log(`Server:        http://localhost:${PORT}`);
+      console.log(`Onion Service: ${ONION_TARGET.split('/')[2]}`);
+      console.log(`Base Domain:   ${RENDER_HOSTNAME}`);
+      console.log(`Health Check:  ${FULL_HEALTH_URL}`);
+      console.log(`External Ping: ${FULL_HEALTH_URL} (via Tor)`);
       console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
     });
 
