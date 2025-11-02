@@ -1,5 +1,5 @@
-# tor-bridge-render.com - SHADOW CORE V100
-# SINGLE FILE | 100% WORKING | RENDER.COM FREE TIER
+# tor-bridge-render.com - SHADOW CORE V101
+# SINGLE FILE | 502 FIXED | RENDER.COM LIVE
 
 FROM node:20-slim
 
@@ -8,7 +8,7 @@ RUN apt-get update && \
     apt-get install -y --no-install-recommends tor curl && \
     rm -rf /var/lib/apt/lists/*
 
-# --- 2. Fix Tor directories ---
+# --- 2. Tor dirs ---
 RUN mkdir -p /var/lib/tor /var/log/tor && \
     chown debian-tor:debian-tor /var/lib/tor /var/log/tor
 
@@ -22,15 +22,15 @@ ControlPort 9051
 CookieAuthentication 1
 EOF
 
-# --- 4. Switch to debian-tor ---
+# --- 4. User ---
 USER debian-tor
 WORKDIR /app
 
 # --- 5. package.json ---
 RUN cat > package.json << 'EOF'
 {
-  "name": "tor-bridge-v100",
-  "version": "100.0.0",
+  "name": "tor-bridge-v101",
+  "version": "101.0.0",
   "type": "module",
   "scripts": {
     "start": "node app.js"
@@ -41,20 +41,19 @@ RUN cat > package.json << 'EOF'
 }
 EOF
 
-# --- 6. Install deps ---
+# --- 6. Install ---
 RUN npm install --production
 
-# --- 7. app.js — V100 (100% WORKING) ---
+# --- 7. app.js — V101 (HTTP over SOCKS + 502 FIX) ---
 RUN cat > app.js << 'EOF'
 import { spawn } from 'child_process';
 import http from 'http';
-import https from 'https';
 import { SocksProxyAgent } from 'socks-proxy-agent';
 
 // === CONFIG ===
-const ONION_TARGET = 'https://duckduckgogg42xjoc72x3sjasowoarfbgcmvfimaftt6twagswzczad.onion/';
+const ONION_HOST = 'duckduckgogg42xjoc72x3sjasowoarfbgcmvfimaftt6twagswzczad.onion';
 const PORT = process.env.PORT || 10000;
-const SOCKS = 'socks5://127.0.0.1:9050';
+const SOCKS = 'socks5h://127.0.0.1:9050';  // DNS over Tor
 
 let tor, agent;
 
@@ -70,7 +69,7 @@ function startTor() {
   });
 }
 
-// === BOOTSTRAP WAIT ===
+// === BOOTSTRAP ===
 function waitForBootstrap() {
   return new Promise((resolve, reject) => {
     const seen = new Set();
@@ -83,7 +82,7 @@ function waitForBootstrap() {
         const pct = parseInt(match[1], 10);
         if (!seen.has(pct)) {
           seen.add(pct);
-          console.log(`[V100] Bootstrap: ${pct}%`);
+          console.log(`[V101] Bootstrap: ${pct}%`);
         }
         if (pct === 100) {
           clearTimeout(timeout);
@@ -102,7 +101,7 @@ function createAgent() {
   agent = new SocksProxyAgent(SOCKS);
 }
 
-// === CRON PING (DIRECT) ===
+// === CRON PING ===
 function startCronPing() {
   const ping = () => {
     const req = http.request({
@@ -118,45 +117,42 @@ function startCronPing() {
   setTimeout(ping, 15000);
 }
 
-// === PROXY HANDLER ===
+// === PROXY HANDLER (HTTP over Tor → HTTPS onion) ===
 function proxyHandler(req, res) {
   if (req.url === '/health') {
     res.writeHead(200, { 'Content-Type': 'text/plain' });
-    return res.end('V100 LIVE');
+    return res.end('V101 LIVE');
   }
 
-  try {
-    const url = new URL(ONION_TARGET + req.url.replace(/^\/+/, ''));
-    const opts = {
-      hostname: url.hostname,
-      port: url.port || 443,
-      path: url.pathname + url.search,
-      method: req.method,
-      headers: { ...req.headers, host: req.headers.host },
-      agent
-    };
+  const path = req.url.replace(/^\/+/, '');
+  const opts = {
+    hostname: ONION_HOST,
+    port: 443,
+    path: '/' + path,
+    method: req.method,
+    headers: { ...req.headers, host: ONION_HOST },
+    agent,
+    createConnection: agent.createConnection  // Force SOCKS
+  };
 
-    const client = https.request(opts, proxyRes => {
-      res.writeHead(proxyRes.statusCode, proxyRes.headers);
-      proxyRes.pipe(res);
-    });
+  const client = http.request(opts, proxyRes => {
+    res.writeHead(proxyRes.statusCode, proxyRes.headers);
+    proxyRes.pipe(res);
+  });
 
-    req.pipe(client);
+  req.pipe(client);
 
-    client.on('error', () => {
-      if (!res.headersSent) res.writeHead(502);
-      res.end();
-    });
-  } catch {
-    res.writeHead(400);
-    res.end();
-  }
+  client.on('error', err => {
+    console.error('[PROXY ERROR]', err.message);
+    if (!res.headersSent) res.writeHead(502);
+    res.end('Bad Gateway');
+  });
 }
 
 // === MAIN ===
 (async () => {
   try {
-    console.log('[V100] Starting...');
+    console.log('[V101] Starting...');
     await startTor();
     await waitForBootstrap();
     createAgent();
@@ -165,10 +161,9 @@ function proxyHandler(req, res) {
     const server = http.createServer(proxyHandler);
     server.listen(PORT, '0.0.0.0', () => {
       console.log('================================');
-      console.log('SHΔDØW CORE V100 — 100% LIVE');
-      console.log(`Socks: 127.0.0.1:9050`);
+      console.log('SHΔDØW CORE V101 — 100% LIVE');
       console.log(`Bridge: http://0.0.0.0:${PORT}`);
-      console.log(`Target: ${ONION_TARGET}`);
+      console.log(`Target: http://${ONION_HOST}/`);
       console.log('================================');
     });
 
@@ -185,7 +180,7 @@ function proxyHandler(req, res) {
 })();
 EOF
 
-# --- 8. Expose + Healthcheck ---
+# --- 8. Healthcheck ---
 EXPOSE 10000
 
 HEALTHCHECK --interval=30s --timeout=10s --start-period=200s --retries=5 \
