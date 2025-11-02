@@ -1,21 +1,65 @@
-# --- ONLY UPDATE app.js IN DOCKERFILE ---
-# Replace the app.js section with this:
+# tor-bridge-render.com - SHADOW CORE V99.2
+# ESM DEFAULT FIXED | PORT BIND | RENDER.COM FREE TIER
 
+FROM node:20-slim
+
+# --- 1. Install Tor + curl ---
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends tor curl && \
+    rm -rf /var/lib/apt/lists/*
+
+# --- 2. torrc + DataDirectory ---
+RUN mkdir -p /home/debian-tor/.tor && \
+    chown debian-tor:debian-tor /home/debian-tor/.tor && \
+    cat > /etc/tor/torrc << 'EOF'
+SocksPort 9050
+Log notice stdout
+DataDirectory /home/debian-tor/.tor
+RunAsDaemon 0
+ControlPort 9051
+CookieAuthentication 1
+EOF
+
+# --- 3. Switch to debian-tor ---
+USER debian-tor
+WORKDIR /home/debian-tor/app
+
+# --- 4. package.json ---
+RUN cat > package.json << 'EOF'
+{
+  "name": "tor-bridge-shadow",
+  "version": "99.2.0",
+  "type": "module",
+  "main": "app.js",
+  "scripts": {
+    "start": "node app.js"
+  },
+  "dependencies": {
+    "http-proxy-agent": "^7.0.2"
+  }
+}
+EOF
+
+# --- 5. Install deps ---
+RUN npm install --production
+
+# --- 6. app.js — V99.2 (DEFAULT + PORT BIND) ---
 RUN cat > app.js << 'EOF'
 import { spawn } from 'child_process';
 import http from 'http';
 import https from 'https';
 
-// === DYNAMIC ESM IMPORT ===
-const { HttpsProxyAgent } = await import('http-proxy-agent');
+// === DYNAMIC ESM IMPORT + DEFAULT EXTRACTION ===
+const proxyModule = await import('http-proxy-agent');
+const HttpsProxyAgent = proxyModule.default;
 
 const ONION_TARGET = 'https://duckduckgogg42xjoc72x3sjasowoarfbgcmvfimaftt6twagswzczad.onion/';
 const PORT = process.env.PORT || 10000;
 const SOCKS = 'socks5://127.0.0.1:9050';
 
-let tor, agent, server;
+let tor, agent;
 
-// === TOR LAUNCH (BACKGROUND) ===
+// === TOR LAUNCH ===
 function startTor() {
   return new Promise((resolve, reject) => {
     tor = spawn('tor', ['-f', '/etc/tor/torrc']);
@@ -29,11 +73,11 @@ function startTor() {
   });
 }
 
-// === BOOTSTRAP MONITOR ===
-async function waitForBootstrap() {
+// === BOOTSTRAP 100% ===
+function waitForBootstrap() {
   return new Promise((resolve, reject) => {
     const seen = new Set();
-    const timeout = setTimeout(() => reject(new Error('Tor bootstrap timeout')), 180000);
+    const timeout = setTimeout(() => reject(new Error('Tor bootstrap timeout')), 120000);
 
     const check = data => {
       const line = data.toString();
@@ -61,12 +105,11 @@ async function createAgent() {
   agent = new HttpsProxyAgent(SOCKS);
 }
 
-// === CRON PING (KEEP ALIVE) ===
+// === CRON PING ===
 function startCronPing() {
   const ping = () => {
-    if (!agent) return;
     const req = http.request({
-      hostname: '127.0.0.1',
+      hostname: 'localhost',
       port: PORT,
       path: '/health',
       method: 'GET',
@@ -79,17 +122,11 @@ function startCronPing() {
   setTimeout(ping, 15000);
 }
 
-// === PROXY HANDLER (GUARDED) ===
+// === PROXY CORE ===
 function proxyHandler(req, res) {
   if (req.url === '/health') {
-    const status = agent ? 'SHADOW CORE V99.2 — LIVE (Tor 100%)' : 'SHADOW CORE V99.2 — STARTING (Tor bootstrapping...)';
     res.writeHead(200, { 'Content-Type': 'text/plain', 'Cache-Control': 'no-cache' });
-    return res.end(status);
-  }
-
-  if (!agent) {
-    res.writeHead(503);
-    return res.end('Tor not ready');
+    return res.end('SHADOW CORE V99.2 — LIVE');
   }
 
   try {
@@ -121,32 +158,31 @@ function proxyHandler(req, res) {
   }
 }
 
-// === SHADOW MAIN — NON-BLOCKING START ===
+// === SHADOW MAIN ===
 (async () => {
   try {
     console.log('[SHADOW CORE V99.2] Initializing...');
-
-    // === 1. START SERVER IMMEDIATELY (RENDER DETECTS PORT) ===
-    server = http.createServer(proxyHandler);
-    server.listen(PORT, '0.0.0.0', () => {
-      console.log('=====================================');
-      console.log('SHΔDØW CORE V99.2 — PORT BOUND');
-      console.log(`Bridge LISTENING: 0.0.0.0:${PORT}`);
-      console.log('Render will detect in < 10s');
-      console.log('=====================================');
-    });
-
-    // === 2. LAUNCH TOR IN BACKGROUND ===
     await startTor();
     await waitForBootstrap();
     await createAgent();
     startCronPing();
 
-    console.log('=====================================');
-    console.log('SHΔDØW CORE V99.2 — FULLY OPERATIONAL');
-    console.log(`Tor Socks5: 127.0.0.1:9050`);
-    console.log(`Target: ${ONION_TARGET}`);
-    console.log('=====================================');
+    const server = http.createServer(proxyHandler);
+    server.listen(PORT, '0.0.0.0', () => {
+      console.log('=====================================');
+      console.log('SHΔDØW CORE V99.2 — FULLY OPERATIONAL');
+      console.log(`Tor Socks5: 127.0.0.1:9050`);
+      console.log(`Bridge LIVE: http://0.0.0.0:${PORT}`);
+      console.log(`Target: ${ONION_TARGET}`);
+      console.log('=====================================');
+    });
+
+    process.on('SIGTERM', () => {
+      console.log('[SHUTDOWN] Terminating Tor...');
+      tor?.kill();
+      server.close();
+      process.exit(0);
+    });
 
   } catch (err) {
     console.error('==>[FATAL SHADOW FAILURE]<==');
@@ -154,11 +190,12 @@ function proxyHandler(req, res) {
     process.exit(1);
   }
 })();
-
-process.on('SIGTERM', () => {
-  console.log('[SHUTDOWN] Terminating...');
-  tor?.kill();
-  server?.close();
-  process.exit(0);
-});
 EOF
+
+# --- 7. Expose + Healthcheck ---
+EXPOSE 10000
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=200s --retries=5 \
+  CMD curl -f http://localhost:10000/health || exit 1
+
+CMD ["npm", "start"]
