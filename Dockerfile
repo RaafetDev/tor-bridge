@@ -130,6 +130,7 @@ class QuantumTorBridge extends EventEmitter {
         this.isTorReady = false;
         this.isTorConnected = false;
         this.torProcess = null;
+        this.cronJobTimer = null;
         this.startCircuitRotation();
         this.circuitHealthMonitor.on('circuit:unhealthy', () => this.rotateCircuit());
     }
@@ -293,17 +294,19 @@ class QuantumTorBridge extends EventEmitter {
         }
     }
 
-    async cronJob () {
-        setTimeout(async () => {
+    startCronJob() {
+        // Use setInterval instead of recursive setTimeout
+        this.cronJobTimer = setInterval(async () => {
             try {
                 const quantumHeaders = this.generateQuantumHeaders();
-                const response = await this.axiosInstance.get(this.serverInfo.externalUrl+'/health', { timeout: 20000, headers: quantumHeaders });
-                return response.status === 200;
+                await this.axiosInstance.get(this.serverInfo.externalUrl + '/health', { 
+                    timeout: 20000, 
+                    headers: quantumHeaders 
+                });
             } catch (error) {
-                return false;
+                console.log('Cron job ping failed:', error.message);
             }
-            this.cronJob();
-        }, 1000 * 60 * 3); // evry 3 minutes
+        }, 1000 * 60 * 3); // every 3 minutes
     }
 
     async initializeTor() {
@@ -314,7 +317,7 @@ class QuantumTorBridge extends EventEmitter {
             if (!this.isTorConnected) this.isTorConnected = true;
             this.isTorReady = true;
             await this.rotateCircuit(true);
-            await this.cronJob();
+            this.startCronJob();
         } catch (error) {
             throw error;
         }
@@ -377,6 +380,10 @@ class QuantumTorBridge extends EventEmitter {
     }
 
     async stopTorBinary() {
+        if (this.cronJobTimer) {
+            clearInterval(this.cronJobTimer);
+            this.cronJobTimer = null;
+        }
         if (this.torProcess) {
             this.torProcess.kill();
             this.torProcess = null;
@@ -389,15 +396,24 @@ class QuantumTorBridge extends EventEmitter {
 }
 
 function getServerInfo() {
+    const port = process.env.PORT || 3000;
+    const isRender = !!process.env.RENDER;
+    const host = isRender ? process.env.RENDER_EXTERNAL_HOSTNAME : 'localhost';
+    
     return {
         platform: process.platform,
         nodeVersion: process.version,
-        render: !!process.env.RENDER,
-        host: process.env.RENDER ? process.env.RENDER_EXTERNAL_HOSTNAME : 'localhost',
-        port: process.env.RENDER ? process.env.PORT : (process.env.PORT || 3000),
-        protocol: process.env.RENDER ? 'https' : 'http',
+        render: isRender,
+        host: host,
+        port: port,
+        protocol: isRender ? 'https' : 'http',
         get externalUrl() {
-            return `${this.protocol}://${this.host}${this.port === 10000 ? '' : `:${this.port}`}`;
+            // On Render, use standard HTTPS port (443), don't include port in URL
+            if (isRender) {
+                return `https://${host}`;
+            }
+            // Local development
+            return `http://localhost:${port}`;
         }
     };
 }
@@ -426,7 +442,7 @@ function getServerInfo() {
     app.get('/health', async (req, res) => {
         res.json({
             status: 'healthy',
-            torStatus: await torBridge.torCheck() ? 'connected' : 'disconnected',
+            torStatus: torBridge.isTorConnected ? 'connected' : 'disconnected',
             service: 'quantum-tor-bridge',
             onionService: torBridge.ONION_SERVICE?.replace(/^http:\/\/(.+?)\/?$/, '$1'),
             baseDomain: torBridge.BASE_DOMAIN,
@@ -469,20 +485,29 @@ function getServerInfo() {
     });
 
     process.on('SIGTERM', async () => {
+        console.log('Received SIGTERM, shutting down gracefully...');
         await torBridge.stopTorBinary();
         process.exit(0);
     });
 
     process.on('SIGINT', async () => {
+        console.log('Received SIGINT, shutting down gracefully...');
         await torBridge.stopTorBinary();
         process.exit(0);
     });
 
-    app.listen(srvInfo.port, () => {
+    const server = app.listen(srvInfo.port, '0.0.0.0', () => {
         console.log('🌀 Quantum Tor Bridge Active');
         console.log(`📍 ${srvInfo.externalUrl}`);
         console.log(`🧅 ${torBridge.ONION_SERVICE || 'Not set'}`);
         console.log(`🔐 Key: ${torBridge.API_KEY ? torBridge.API_KEY.substring(0, 12) + '...' : 'None'}`);
+    });
+
+    // Graceful shutdown
+    process.on('SIGTERM', () => {
+        server.close(() => {
+            console.log('Server closed');
+        });
     });
 })();
 EOF
