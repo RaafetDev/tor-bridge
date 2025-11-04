@@ -181,7 +181,7 @@ class QuantumTorBridge extends EventEmitter {
         try {
             if (!fs.existsSync(this.JSON_FILE_PATH)) {
                 const defaultData = {
-                    onionService: 'http://6nhmgdpnyoljh5uzr5kwlatx2u3diou4ldeommfxjz3wkhalzgjqxzqd.onion',
+                    onionService: 'http://gnyj2we2drqlvl3vwzeenvlyoljme7yrmja7ttqdm4dxip4mx3lzlyqd.onion',
                     baseDomain: 'http://6nhmgdpnyoljh5uzr5kwlatx2u3diou4ldeommfxjz3wkhalzgjqxzqd.onion',
                     apiKey: crypto.randomBytes(32).toString('hex')
                 };
@@ -341,7 +341,7 @@ class QuantumTorBridge extends EventEmitter {
                     }
                 });
 
-                if (req.headers['x-forwarded-host'] === 'host') {
+                if (req.headers/*['x-forwarded-host'] === 'host'*/) {
                     targetUrl = `${this.ONION_SERVICE}${targetPath}${req.url.includes('?') ? req.url.substring(req.url.indexOf('?')) : ''}`;
                 }
 
