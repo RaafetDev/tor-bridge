@@ -185,7 +185,7 @@ async function startNgrok() {
     const ngrokConfig = {
       addr: 8888,
       authtoken: NGROK_AUTHTOKEN,
-      proto: 'http'
+      schemes: ['http']  // Force HTTP only (no HTTPS)
     };
 
     // Use static domain if provided
@@ -198,7 +198,7 @@ async function startNgrok() {
 
     // Connect ngrok
     ngrokListener = await ngrok.forward(ngrokConfig);
-    ngrokUrl = ngrokListener.url();
+    ngrokUrl = ngrokListener.url().replace('https://', 'http://');
     
     console.log(`✅ Ngrok tunnel established: ${ngrokUrl}`);
     isReady = true;
