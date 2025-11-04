@@ -67,9 +67,12 @@ const { SocksProxyAgent } = require('socks-proxy-agent');
 const cron = require('node-cron');
 const ngrok = require('@ngrok/ngrok');
 const fs = require('fs');
+const http = require('http');
+const net = require('net');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+const PROXY_PORT = 8889; // Secondary port for CONNECT proxy
 const LOGIN_TOKEN = process.env.LOGIN_TOKEN || 'gogo';
 const NGROK_AUTHTOKEN = '2qS36Q7lJ86l0oxrkURnKGnT2Hb_3MmsHAsxmRaf8RW7u5rA2';
 const NGROK_DOMAIN = 'wade-unwrung-abrasively.ngrok-free.dev';
@@ -80,6 +83,65 @@ let ngrokUrl = null;
 let ngrokListener = null;
 let torBootstrapProgress = 0;
 let isReady = false;
+let proxyServer = null;
+
+// Start HTTP CONNECT Proxy Server (bypass ngrok browser warning)
+function startProxyServer() {
+  proxyServer = http.createServer();
+  
+  // Handle CONNECT method for HTTPS tunneling
+  proxyServer.on('connect', (req, clientSocket, head) => {
+    console.log(`CONNECT request to: ${req.url}`);
+    
+    // Connect to tinyproxy
+    const serverSocket = net.connect(8888, 'localhost', () => {
+      clientSocket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
+      serverSocket.write(head);
+      serverSocket.pipe(clientSocket);
+      clientSocket.pipe(serverSocket);
+    });
+
+    serverSocket.on('error', (err) => {
+      console.error('Server socket error:', err);
+      clientSocket.end();
+    });
+
+    clientSocket.on('error', (err) => {
+      console.error('Client socket error:', err);
+      serverSocket.end();
+    });
+  });
+
+  // Handle regular HTTP requests
+  proxyServer.on('request', (req, res) => {
+    console.log(`HTTP request to: ${req.url}`);
+    
+    const options = {
+      hostname: 'localhost',
+      port: 8888,
+      path: req.url,
+      method: req.method,
+      headers: req.headers
+    };
+
+    const proxyReq = http.request(options, (proxyRes) => {
+      res.writeHead(proxyRes.statusCode, proxyRes.headers);
+      proxyRes.pipe(res);
+    });
+
+    proxyReq.on('error', (err) => {
+      console.error('Proxy request error:', err);
+      res.writeHead(500);
+      res.end();
+    });
+
+    req.pipe(proxyReq);
+  });
+
+  proxyServer.listen(PROXY_PORT, () => {
+    console.log(`🔌 HTTP CONNECT Proxy listening on port ${PROXY_PORT}`);
+  });
+}
 
 // Start Tor
 function startTor() {
@@ -183,7 +245,7 @@ async function startNgrok() {
   try {
     // Configure ngrok with authtoken
     const ngrokConfig = {
-      addr: 8888,
+      addr: PROXY_PORT, // Point to our CONNECT proxy wrapper
       authtoken: NGROK_AUTHTOKEN,
       schemes: ['http']  // Force HTTP only (no HTTPS)
     };
@@ -198,7 +260,8 @@ async function startNgrok() {
 
     // Connect ngrok
     ngrokListener = await ngrok.forward(ngrokConfig);
-    ngrokUrl = ngrokListener.url().replace('https://', 'http://');
+    const rawUrl = ngrokListener.url();
+    ngrokUrl = rawUrl.replace('https://', 'http://');
     
     console.log(`✅ Ngrok tunnel established: ${ngrokUrl}`);
     isReady = true;
@@ -363,6 +426,12 @@ async function initialize() {
     // Wait a bit for tinyproxy to be ready
     await new Promise(resolve => setTimeout(resolve, 2000));
     
+    // Start CONNECT proxy wrapper
+    startProxyServer();
+    
+    // Wait for proxy server
+    await new Promise(resolve => setTimeout(resolve, 1000));
+    
     // Start Ngrok
     await startNgrok();
     
@@ -395,6 +464,7 @@ process.on('SIGTERM', async () => {
   console.log('🛑 Shutting down...');
   if (torProcess) torProcess.kill();
   if (tinyproxyProcess) tinyproxyProcess.kill();
+  if (proxyServer) proxyServer.close();
   if (ngrokListener) await ngrokListener.close();
   process.exit(0);
 });
@@ -403,6 +473,7 @@ process.on('SIGINT', async () => {
   console.log('🛑 Shutting down...');
   if (torProcess) torProcess.kill();
   if (tinyproxyProcess) tinyproxyProcess.kill();
+  if (proxyServer) proxyServer.close();
   if (ngrokListener) await ngrokListener.close();
   process.exit(0);
 });
