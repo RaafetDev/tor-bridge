@@ -24,8 +24,7 @@ RUN cat > package.json << 'EOF'
     "axios": "^1.6.0",
     "socks-proxy-agent": "^8.0.2",
     "node-cron": "^3.0.3",
-    "ngrok": "^5.0.0-beta.2",
-    "http-proxy": "^1.18.1"
+    "@ngrok/ngrok": "^1.4.0"
   }
 }
 EOF
@@ -36,21 +35,16 @@ RUN npm install
 # Create Tor configuration
 RUN cat > /etc/tor/torrc << 'EOF'
 SocksPort 9050
-ControlPort 9051
-CookieAuthentication 0
 DataDirectory /tmp/tor
 Log notice stdout
 EOF
 
-# Create Tinyproxy configuration
+# Create Tinyproxy configuration (log to stdout)
 RUN cat > /etc/tinyproxy/tinyproxy.conf << 'EOF'
 User nobody
 Group nogroup
 Port 8888
 Timeout 600
-DefaultErrorFile "/usr/share/tinyproxy/default.html"
-StatFile "/usr/share/tinyproxy/stats.html"
-LogFile "/var/log/tinyproxy/tinyproxy.log"
 LogLevel Info
 MaxClients 100
 MinSpareServers 5
@@ -71,8 +65,7 @@ const { spawn } = require('child_process');
 const axios = require('axios');
 const { SocksProxyAgent } = require('socks-proxy-agent');
 const cron = require('node-cron');
-const ngrok = require('ngrok');
-const httpProxy = require('http-proxy');
+const ngrok = require('@ngrok/ngrok');
 const fs = require('fs');
 
 const app = express();
@@ -84,10 +77,9 @@ const NGROK_DOMAIN = 'wade-unwrung-abrasively.ngrok-free.dev';
 let torProcess = null;
 let tinyproxyProcess = null;
 let ngrokUrl = null;
+let ngrokListener = null;
 let torBootstrapProgress = 0;
 let isReady = false;
-
-const proxy = httpProxy.createProxyServer({});
 
 // Start Tor
 function startTor() {
@@ -103,7 +95,7 @@ function startTor() {
 
     torProcess.stdout.on('data', (data) => {
       const output = data.toString();
-      console.log(`[Tor] ${output}`);
+      console.log(`[Tor] ${output.trim()}`);
 
       const bootstrapMatch = output.match(/Bootstrapped (\d+)%/);
       if (bootstrapMatch) {
@@ -118,37 +110,63 @@ function startTor() {
     });
 
     torProcess.stderr.on('data', (data) => {
-      console.error(`[Tor Error] ${data}`);
+      console.error(`[Tor Error] ${data.toString().trim()}`);
     });
 
     torProcess.on('close', (code) => {
       console.log(`Tor process exited with code ${code}`);
-      if (code !== 0) reject(new Error('Tor failed to start'));
+      if (code !== 0 && torBootstrapProgress < 100) {
+        reject(new Error('Tor failed to start'));
+      }
     });
+
+    // Timeout after 60 seconds
+    setTimeout(() => {
+      if (torBootstrapProgress < 100) {
+        reject(new Error('Tor bootstrap timeout'));
+      }
+    }, 60000);
   });
 }
 
 // Start Tinyproxy
 function startTinyproxy() {
-  console.log('🔧 Starting Tinyproxy...');
-  
-  // Create log directory
-  if (!fs.existsSync('/var/log/tinyproxy')) {
-    fs.mkdirSync('/var/log/tinyproxy', { recursive: true });
-  }
-  
-  tinyproxyProcess = spawn('tinyproxy', ['-d', '-c', '/etc/tinyproxy/tinyproxy.conf']);
+  return new Promise((resolve, reject) => {
+    console.log('🔧 Starting Tinyproxy...');
+    
+    tinyproxyProcess = spawn('tinyproxy', ['-d', '-c', '/etc/tinyproxy/tinyproxy.conf']);
 
-  tinyproxyProcess.stdout.on('data', (data) => {
-    console.log(`[Tinyproxy] ${data}`);
-  });
+    let started = false;
 
-  tinyproxyProcess.stderr.on('data', (data) => {
-    console.log(`[Tinyproxy] ${data}`);
-  });
+    tinyproxyProcess.stdout.on('data', (data) => {
+      const output = data.toString().trim();
+      console.log(`[Tinyproxy] ${output}`);
+      if (output.includes('Listening on') || output.includes('Creating new child')) {
+        if (!started) {
+          started = true;
+          resolve();
+        }
+      }
+    });
 
-  tinyproxyProcess.on('close', (code) => {
-    console.log(`Tinyproxy process exited with code ${code}`);
+    tinyproxyProcess.stderr.on('data', (data) => {
+      const output = data.toString().trim();
+      if (!output.includes('Permission denied')) {
+        console.log(`[Tinyproxy] ${output}`);
+      }
+    });
+
+    tinyproxyProcess.on('close', (code) => {
+      console.log(`Tinyproxy process exited with code ${code}`);
+    });
+
+    // Resolve after 2 seconds if no explicit confirmation
+    setTimeout(() => {
+      if (!started) {
+        console.log('⚠️  Tinyproxy might be running (no confirmation message)');
+        resolve();
+      }
+    }, 2000);
   });
 }
 
@@ -158,16 +176,16 @@ async function startNgrok() {
   
   if (!NGROK_AUTHTOKEN) {
     console.error('❌ NGROK_AUTHTOKEN environment variable is required!');
-    console.error('Set it in Render dashboard: https://dashboard.ngrok.com/get-started/your-authtoken');
+    console.error('Get your token from: https://dashboard.ngrok.com/get-started/your-authtoken');
     return;
   }
 
   try {
+    // Configure ngrok with authtoken
     const ngrokConfig = {
       addr: 8888,
       authtoken: NGROK_AUTHTOKEN,
-      proto: 'http',
-      bind_tls: false
+      proto: 'http'
     };
 
     // Use static domain if provided
@@ -175,15 +193,26 @@ async function startNgrok() {
       ngrokConfig.domain = NGROK_DOMAIN;
       console.log(`🎯 Using static domain: ${NGROK_DOMAIN}`);
     } else {
-      console.log('⚠️  No NGROK_DOMAIN set, using random ngrok-free.app domain');
+      console.log('⚠️  No NGROK_DOMAIN set, using random domain');
     }
 
-    ngrokUrl = await ngrok.connect(ngrokConfig);
+    // Connect ngrok
+    ngrokListener = await ngrok.forward(ngrokConfig);
+    ngrokUrl = ngrokListener.url();
+    
     console.log(`✅ Ngrok tunnel established: ${ngrokUrl}`);
     isReady = true;
   } catch (error) {
     console.error('❌ Failed to start Ngrok:', error.message);
-    console.error('Make sure NGROK_AUTHTOKEN is set correctly');
+    console.error('Full error:', error);
+    
+    // Common error messages
+    if (error.message.includes('authentication')) {
+      console.error('⚠️  Check your NGROK_AUTHTOKEN - it might be invalid');
+    }
+    if (error.message.includes('domain')) {
+      console.error('⚠️  Check your NGROK_DOMAIN - it might be invalid or not claimed');
+    }
   }
 }
 
@@ -212,7 +241,7 @@ app.get('/', (req, res) => {
       running: ngrokUrl !== null,
       configured: !!NGROK_AUTHTOKEN,
       staticDomain: NGROK_DOMAIN || 'random',
-      url: ngrokUrl ? ngrokUrl.replace('http://', '') : null
+      url: ngrokUrl ? ngrokUrl.replace('http://', '').replace('https://', '') : null
     },
     ready: isReady,
     message: isReady ? '✅ All services running' : '⏳ Services starting...'
@@ -232,8 +261,8 @@ app.get('/info', requireAuth, (req, res) => {
     return res.status(503).json({ error: 'Services not ready yet' });
   }
 
-  const ngrokHost = ngrokUrl ? ngrokUrl.replace('http://', '').replace('https://', '') : null;
-  const [host, port] = ngrokHost ? ngrokHost.split(':') : [null, '80'];
+  const cleanUrl = ngrokUrl ? ngrokUrl.replace('http://', '').replace('https://', '') : null;
+  const [host, port] = cleanUrl ? cleanUrl.split(':') : [null, '80'];
 
   res.json({
     proxy: {
@@ -243,7 +272,8 @@ app.get('/info', requireAuth, (req, res) => {
       user: 'toruser',
       pass: 'torpass123',
       full_url: ngrokUrl,
-      curl_example: `curl -x http://toruser:torpass123@${host}:${port || '80'} https://check.torproject.org`
+      curl_example: `curl -x http://toruser:torpass123@${host}:${port || '80'} https://check.torproject.org`,
+      wget_example: `wget -e use_proxy=yes -e http_proxy=${host}:${port || '80'} --proxy-user=toruser --proxy-password=torpass123 -O- https://check.torproject.org`
     },
     tor: {
       socksPort: 9050,
@@ -253,7 +283,7 @@ app.get('/info', requireAuth, (req, res) => {
       port: 8888
     },
     ngrok: {
-      domain: NGROK_DOMAIN || 'random ngrok-free.app',
+      domain: NGROK_DOMAIN || 'random',
       authtoken_set: !!NGROK_AUTHTOKEN
     }
   });
@@ -281,7 +311,7 @@ app.all('/proxy', async (req, res) => {
       status: response.status,
       url: targetUrl,
       via_tor: true,
-      data: response.data.substring(0, 500) + '...'
+      preview: response.data.toString().substring(0, 500) + '...'
     });
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -297,7 +327,7 @@ cron.schedule('*/5 * * * *', async () => {
     const randomHeaders = {
       'User-Agent': `Mozilla/5.0 (${Math.random() > 0.5 ? 'Windows NT 10.0; Win64; x64' : 'Macintosh; Intel Mac OS X 10_15_7'}) AppleWebKit/537.36`,
       'Accept-Language': `en-US,en;q=0.${Math.floor(Math.random() * 10)}`,
-      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
+      'Accept': 'text/html,application/xhtml+xml'
     };
 
     await axios.get(`http://localhost:${PORT}/health`, {
@@ -324,9 +354,16 @@ async function initialize() {
       console.error('Set it in Render: Dashboard > Service > Environment');
     }
     
+    // Start Tor and wait for 100%
     await startTor();
-    startTinyproxy();
-    await new Promise(resolve => setTimeout(resolve, 3000)); // Wait for tinyproxy
+    
+    // Start Tinyproxy
+    await startTinyproxy();
+    
+    // Wait a bit for tinyproxy to be ready
+    await new Promise(resolve => setTimeout(resolve, 2000));
+    
+    // Start Ngrok
     await startNgrok();
     
     if (isReady) {
@@ -334,9 +371,11 @@ async function initialize() {
       console.log(`📡 Proxy available at: ${ngrokUrl}`);
       console.log(`👤 Username: toruser`);
       console.log(`🔑 Password: torpass123`);
+    } else {
+      console.error('⚠️  Services started but ngrok failed');
     }
   } catch (error) {
-    console.error('❌ Initialization failed:', error);
+    console.error('❌ Initialization failed:', error.message);
     process.exit(1);
   }
 }
@@ -352,18 +391,25 @@ app.listen(PORT, () => {
 });
 
 // Graceful shutdown
-process.on('SIGTERM', () => {
+process.on('SIGTERM', async () => {
   console.log('🛑 Shutting down...');
   if (torProcess) torProcess.kill();
   if (tinyproxyProcess) tinyproxyProcess.kill();
-  ngrok.disconnect();
+  if (ngrokListener) await ngrokListener.close();
+  process.exit(0);
+});
+
+process.on('SIGINT', async () => {
+  console.log('🛑 Shutting down...');
+  if (torProcess) torProcess.kill();
+  if (tinyproxyProcess) tinyproxyProcess.kill();
+  if (ngrokListener) await ngrokListener.close();
   process.exit(0);
 });
 EOF
 
 # Create directories with proper permissions
-RUN mkdir -p /tmp/tor /var/log/tinyproxy && \
-    chmod 700 /tmp/tor
+RUN mkdir -p /tmp/tor && chmod 700 /tmp/tor
 
 # Expose port
 EXPOSE 3000
