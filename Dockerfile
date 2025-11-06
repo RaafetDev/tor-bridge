@@ -1,171 +1,139 @@
-FROM node:18-bullseye
+FROM node:18-slim
 
-# Install Tor and Tinyproxy
+# Install Tor, tinyproxy, and required tools
 RUN apt-get update && apt-get install -y \
     tor \
     tinyproxy \
     curl \
+    wget \
     && rm -rf /var/lib/apt/lists/*
 
+# Create app directory
 WORKDIR /app
 
 # Create package.json
-RUN cat > package.json << 'EOF'
+RUN cat > package.json <<'EOF'
 {
-  "name": "tor-proxy-render",
+  "name": "tor-http-proxy",
   "version": "1.0.0",
-  "description": "Public HTTP Tor Proxy with Ngrok",
-  "main": "server.js",
+  "description": "Public Tor-backed HTTP proxy service",
+  "main": "app.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node app.js"
   },
+  "keywords": ["tor", "proxy", "http", "anonymity"],
+  "author": "",
+  "license": "MIT",
   "dependencies": {
     "express": "^4.18.2",
     "axios": "^1.6.0",
-    "socks-proxy-agent": "^8.0.2",
-    "node-cron": "^3.0.3",
-    "@ngrok/ngrok": "^1.4.0"
+    "socks-proxy-agent": "^8.0.2"
   }
 }
 EOF
 
-# Install dependencies
+# Install Node.js dependencies
 RUN npm install
 
-# Create Tor configuration
-RUN cat > /etc/tor/torrc << 'EOF'
-SocksPort 9050
-DataDirectory /tmp/tor
-Log notice stdout
-EOF
-
-# Create Tinyproxy configuration (log to stdout)
-RUN cat > /etc/tinyproxy/tinyproxy.conf << 'EOF'
-User nobody
-Group nogroup
-Port 8888
-Timeout 600
-LogLevel Info
-MaxClients 100
-MinSpareServers 5
-MaxSpareServers 20
-StartServers 10
-MaxRequestsPerChild 0
-Allow 127.0.0.1
-ViaProxyName "tinyproxy"
-DisableViaHeader Yes
-BasicAuth toruser torpass123
-Upstream socks5 127.0.0.1:9050
-EOF
-
-# Create main server application
-RUN cat > server.js << 'EOF'
+# Create app.js
+RUN cat > app.js <<'EOF'
 const express = require('express');
 const { spawn } = require('child_process');
+const fs = require('fs');
+const path = require('path');
 const axios = require('axios');
 const { SocksProxyAgent } = require('socks-proxy-agent');
-const cron = require('node-cron');
-const ngrok = require('@ngrok/ngrok');
-const fs = require('fs');
-const http = require('http');
-const net = require('net');
 
-const app = express();
+// Configuration
 const PORT = process.env.PORT || 3000;
-const PROXY_PORT = 8889; // Secondary port for CONNECT proxy
-const LOGIN_TOKEN = process.env.LOGIN_TOKEN || 'gogo';
-const NGROK_AUTHTOKEN = '2qS36Q7lJ86l0oxrkURnKGnT2Hb_3MmsHAsxmRaf8RW7u5rA2';
-const NGROK_DOMAIN = 'wade-unwrung-abrasively.ngrok-free.dev';
+const PLAYIT_SECRET = process.env.PLAYIT_SECRET || '';
+const TOR_SOCKS_PORT = 9050;
+const TINYPROXY_PORT = 8888;
+const KEEPALIVE_INTERVAL = 5 * 60 * 1000; // 5 minutes
 
+// Service state
+const state = {
+  torRunning: false,
+  tinyproxyRunning: false,
+  playitRunning: false,
+  proxyHost: 'localhost',
+  proxyPort: TINYPROXY_PORT,
+  torBootstrapProgress: 0,
+  startTime: Date.now()
+};
+
+// Process references
 let torProcess = null;
 let tinyproxyProcess = null;
-let ngrokUrl = null;
-let ngrokListener = null;
-let torBootstrapProgress = 0;
-let isReady = false;
-let proxyServer = null;
+let playitProcess = null;
 
-// Start HTTP CONNECT Proxy Server (bypass ngrok browser warning)
-function startProxyServer() {
-  proxyServer = http.createServer();
-  
-  // Handle CONNECT method for HTTPS tunneling
-  proxyServer.on('connect', (req, clientSocket, head) => {
-    console.log(`CONNECT request to: ${req.url}`);
-    
-    // Connect to tinyproxy
-    const serverSocket = net.connect(8888, 'localhost', () => {
-      clientSocket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
-      serverSocket.write(head);
-      serverSocket.pipe(clientSocket);
-      clientSocket.pipe(serverSocket);
-    });
+// === Utility Functions ===
 
-    serverSocket.on('error', (err) => {
-      console.error('Server socket error:', err);
-      clientSocket.end();
-    });
-
-    clientSocket.on('error', (err) => {
-      console.error('Client socket error:', err);
-      serverSocket.end();
-    });
-  });
-
-  // Handle regular HTTP requests
-  proxyServer.on('request', (req, res) => {
-    console.log(`HTTP request to: ${req.url}`);
-    
-    const options = {
-      hostname: 'localhost',
-      port: 8888,
-      path: req.url,
-      method: req.method,
-      headers: req.headers
-    };
-
-    const proxyReq = http.request(options, (proxyRes) => {
-      res.writeHead(proxyRes.statusCode, proxyRes.headers);
-      proxyRes.pipe(res);
-    });
-
-    proxyReq.on('error', (err) => {
-      console.error('Proxy request error:', err);
-      res.writeHead(500);
-      res.end();
-    });
-
-    req.pipe(proxyReq);
-  });
-
-  proxyServer.listen(PROXY_PORT, () => {
-    console.log(`🔌 HTTP CONNECT Proxy listening on port ${PROXY_PORT}`);
-  });
+function log(message) {
+  console.log(`[${new Date().toISOString()}] ${message}`);
 }
 
-// Start Tor
+function generateRandomHeaders() {
+  const userAgents = [
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36',
+    'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36'
+  ];
+  return {
+    'User-Agent': userAgents[Math.floor(Math.random() * userAgents.length)],
+    'X-Request-ID': `keepalive-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
+    'Accept': 'application/json',
+    'Accept-Language': 'en-US,en;q=0.9'
+  };
+}
+
+// === Tor Configuration and Startup ===
+
+function createTorConfig() {
+  const torrcPath = path.join(__dirname, 'tor-data', 'torrc');
+  const torDataDir = path.join(__dirname, 'tor-data');
+  
+  const torrcContent = `
+DataDirectory ${torDataDir}
+SocksPort 0.0.0.0:${TOR_SOCKS_PORT}
+ControlPort 9051
+CookieAuthentication 1
+Log notice stdout
+`;
+  
+  fs.mkdirSync(torDataDir, { recursive: true });
+  fs.writeFileSync(torrcPath, torrcContent.trim());
+  log(`Tor config created at ${torrcPath}`);
+  return torrcPath;
+}
+
 function startTor() {
   return new Promise((resolve, reject) => {
-    console.log('🧅 Starting Tor...');
+    const torrcPath = createTorConfig();
+    log('Starting Tor...');
     
-    // Create tor data directory with proper permissions
-    if (!fs.existsSync('/tmp/tor')) {
-      fs.mkdirSync('/tmp/tor', { recursive: true, mode: 0o700 });
-    }
-    
-    torProcess = spawn('tor', ['-f', '/etc/tor/torrc']);
+    torProcess = spawn('tor', ['-f', torrcPath], {
+      stdio: ['ignore', 'pipe', 'pipe']
+    });
+
+    let bootstrapComplete = false;
 
     torProcess.stdout.on('data', (data) => {
       const output = data.toString();
       console.log(`[Tor] ${output.trim()}`);
-
+      
+      // Parse bootstrap progress
       const bootstrapMatch = output.match(/Bootstrapped (\d+)%/);
       if (bootstrapMatch) {
-        torBootstrapProgress = parseInt(bootstrapMatch[1]);
-        console.log(`🔄 Tor bootstrap progress: ${torBootstrapProgress}%`);
-
-        if (torBootstrapProgress === 100) {
-          console.log('✅ Tor is fully bootstrapped!');
+        state.torBootstrapProgress = parseInt(bootstrapMatch[1]);
+        log(`Tor bootstrap: ${state.torBootstrapProgress}%`);
+      }
+      
+      if (output.includes('Bootstrapped 100%') || output.includes('Done')) {
+        if (!bootstrapComplete) {
+          bootstrapComplete = true;
+          state.torRunning = true;
+          log('Tor successfully bootstrapped!');
           resolve();
         }
       }
@@ -175,314 +143,567 @@ function startTor() {
       console.error(`[Tor Error] ${data.toString().trim()}`);
     });
 
-    torProcess.on('close', (code) => {
-      console.log(`Tor process exited with code ${code}`);
-      if (code !== 0 && torBootstrapProgress < 100) {
-        reject(new Error('Tor failed to start'));
+    torProcess.on('exit', (code) => {
+      log(`Tor process exited with code ${code}`);
+      state.torRunning = false;
+      if (!bootstrapComplete) {
+        reject(new Error(`Tor failed to start (exit code ${code})`));
       }
     });
 
     // Timeout after 60 seconds
     setTimeout(() => {
-      if (torBootstrapProgress < 100) {
+      if (!bootstrapComplete) {
         reject(new Error('Tor bootstrap timeout'));
       }
     }, 60000);
   });
 }
 
-// Start Tinyproxy
+// === Tinyproxy Configuration and Startup ===
+
+function createTinyproxyConfig() {
+  const configPath = path.join(__dirname, 'tinyproxy.conf');
+  const logPath = path.join(__dirname, 'logs', 'tinyproxy.log');
+  
+  const configContent = `
+Port ${TINYPROXY_PORT}
+Listen 0.0.0.0
+Timeout 600
+DefaultErrorFile "/usr/share/tinyproxy/default.html"
+LogFile "${logPath}"
+LogLevel Info
+MaxClients 100
+MinSpareServers 5
+MaxSpareServers 20
+StartServers 10
+MaxRequestsPerChild 0
+Allow 0.0.0.0/0
+ViaProxyName "TorProxy"
+DisableViaHeader No
+Upstream socks5 127.0.0.1:${TOR_SOCKS_PORT}
+`;
+
+  fs.mkdirSync(path.dirname(logPath), { recursive: true });
+  fs.writeFileSync(configPath, configContent.trim());
+  log(`Tinyproxy config created at ${configPath}`);
+  return configPath;
+}
+
 function startTinyproxy() {
   return new Promise((resolve, reject) => {
-    console.log('🔧 Starting Tinyproxy...');
+    const configPath = createTinyproxyConfig();
+    log('Starting Tinyproxy...');
     
-    tinyproxyProcess = spawn('tinyproxy', ['-d', '-c', '/etc/tinyproxy/tinyproxy.conf']);
+    tinyproxyProcess = spawn('tinyproxy', ['-d', '-c', configPath], {
+      stdio: ['ignore', 'pipe', 'pipe']
+    });
 
     let started = false;
 
     tinyproxyProcess.stdout.on('data', (data) => {
-      const output = data.toString().trim();
-      console.log(`[Tinyproxy] ${output}`);
-      if (output.includes('Listening on') || output.includes('Creating new child')) {
-        if (!started) {
-          started = true;
-          resolve();
-        }
+      const output = data.toString();
+      console.log(`[Tinyproxy] ${output.trim()}`);
+      
+      if (!started && (output.includes('listening') || output.includes('Initializing'))) {
+        started = true;
+        state.tinyproxyRunning = true;
+        log('Tinyproxy successfully started!');
+        setTimeout(resolve, 2000);
       }
     });
 
     tinyproxyProcess.stderr.on('data', (data) => {
-      const output = data.toString().trim();
-      if (!output.includes('Permission denied')) {
-        console.log(`[Tinyproxy] ${output}`);
+      const output = data.toString();
+      console.log(`[Tinyproxy] ${output.trim()}`);
+      if (!started && output.includes('Listening on')) {
+        started = true;
+        state.tinyproxyRunning = true;
+        log('Tinyproxy successfully started!');
+        setTimeout(resolve, 2000);
       }
     });
 
-    tinyproxyProcess.on('close', (code) => {
-      console.log(`Tinyproxy process exited with code ${code}`);
+    tinyproxyProcess.on('exit', (code) => {
+      log(`Tinyproxy process exited with code ${code}`);
+      state.tinyproxyRunning = false;
+      if (!started) {
+        reject(new Error(`Tinyproxy failed to start (exit code ${code})`));
+      }
     });
 
-    // Resolve after 2 seconds if no explicit confirmation
+    // Fallback - assume started after 5 seconds
     setTimeout(() => {
       if (!started) {
-        console.log('⚠️  Tinyproxy might be running (no confirmation message)');
+        log('Tinyproxy assumed started (timeout fallback)');
+        state.tinyproxyRunning = true;
+        started = true;
         resolve();
       }
-    }, 2000);
+    }, 5000);
   });
 }
 
-// Start Ngrok
-async function startNgrok() {
-  console.log('🌐 Starting Ngrok tunnel...');
-  
-  if (!NGROK_AUTHTOKEN) {
-    console.error('❌ NGROK_AUTHTOKEN environment variable is required!');
-    console.error('Get your token from: https://dashboard.ngrok.com/get-started/your-authtoken');
-    return;
+// === Playit.gg Agent (Optional) ===
+
+function startPlayit() {
+  if (!PLAYIT_SECRET) {
+    log('No PLAYIT_SECRET provided, skipping playit agent');
+    state.playitRunning = false;
+    return Promise.resolve();
   }
 
-  try {
-    // Configure ngrok with authtoken
-    const ngrokConfig = {
-      addr: PROXY_PORT, // Point to our CONNECT proxy wrapper
-      authtoken: NGROK_AUTHTOKEN,
-      schemes: ['http']  // Force HTTP only (no HTTPS)
-    };
-
-    // Use static domain if provided
-    if (NGROK_DOMAIN) {
-      ngrokConfig.domain = NGROK_DOMAIN;
-      console.log(`🎯 Using static domain: ${NGROK_DOMAIN}`);
+  return new Promise((resolve) => {
+    log('Starting playit.gg agent...');
+    
+    const agentPath = path.join(__dirname, 'playit');
+    
+    if (!fs.existsSync(agentPath)) {
+      log('Downloading playit agent...');
+      const downloadUrl = 'https://playit.gg/downloads/playit-linux-amd64';
+      
+      const downloadProcess = spawn('curl', ['-L', '-o', agentPath, downloadUrl]);
+      
+      downloadProcess.on('exit', (code) => {
+        if (code === 0) {
+          fs.chmodSync(agentPath, '755');
+          startPlayitProcess(agentPath, resolve);
+        } else {
+          log('Failed to download playit agent');
+          resolve();
+        }
+      });
     } else {
-      console.log('⚠️  No NGROK_DOMAIN set, using random domain');
+      startPlayitProcess(agentPath, resolve);
     }
+  });
+}
 
-    // Connect ngrok
-    ngrokListener = await ngrok.forward(ngrokConfig);
-    const rawUrl = ngrokListener.url();
-    ngrokUrl = rawUrl.replace('https://', 'http://');
+function startPlayitProcess(agentPath, callback) {
+  playitProcess = spawn(agentPath, ['--secret', PLAYIT_SECRET], {
+    stdio: ['ignore', 'pipe', 'pipe']
+  });
+
+  playitProcess.stdout.on('data', (data) => {
+    const output = data.toString();
+    console.log(`[Playit] ${output.trim()}`);
     
-    console.log(`✅ Ngrok tunnel established: ${ngrokUrl}`);
-    isReady = true;
+    const hostMatch = output.match(/host[:\s]+([a-z0-9\-\.]+)/i);
+    const portMatch = output.match(/port[:\s]+(\d+)/i);
+    
+    if (hostMatch && portMatch) {
+      state.proxyHost = hostMatch[1];
+      state.proxyPort = parseInt(portMatch[1]);
+      log(`Playit tunnel: ${state.proxyHost}:${state.proxyPort}`);
+    }
+  });
+
+  playitProcess.stderr.on('data', (data) => {
+    console.log(`[Playit] ${data.toString().trim()}`);
+  });
+
+  playitProcess.on('exit', (code) => {
+    log(`Playit process exited with code ${code}`);
+    state.playitRunning = false;
+  });
+
+  state.playitRunning = true;
+  log('Playit agent started');
+  setTimeout(callback, 3000);
+}
+
+// === Keepalive System ===
+
+async function keepalive() {
+  try {
+    const socksAgent = new SocksProxyAgent(`socks5://127.0.0.1:${TOR_SOCKS_PORT}`);
+    const headers = generateRandomHeaders();
+    
+    const response = await axios.get(`http://localhost:${PORT}/health`, {
+      httpAgent: socksAgent,
+      httpsAgent: socksAgent,
+      headers: headers,
+      timeout: 30000
+    });
+    
+    log(`Keepalive successful: ${response.status}`);
   } catch (error) {
-    console.error('❌ Failed to start Ngrok:', error.message);
-    console.error('Full error:', error);
-    
-    // Common error messages
-    if (error.message.includes('authentication')) {
-      console.error('⚠️  Check your NGROK_AUTHTOKEN - it might be invalid');
-    }
-    if (error.message.includes('domain')) {
-      console.error('⚠️  Check your NGROK_DOMAIN - it might be invalid or not claimed');
-    }
+    log(`Keepalive error: ${error.message}`);
   }
 }
 
-// Middleware for authentication
-function requireAuth(req, res, next) {
-  const token = req.headers['authorization'] || req.headers['login'];
-  if (token === LOGIN_TOKEN) {
-    next();
-  } else {
-    res.status(401).json({ error: 'Unauthorized - Missing or invalid login header' });
-  }
+function startKeepalive() {
+  log(`Starting keepalive system (interval: ${KEEPALIVE_INTERVAL / 1000}s)`);
+  setInterval(keepalive, KEEPALIVE_INTERVAL);
+  setTimeout(keepalive, 30000);
 }
 
-// Routes
+// === Express Server ===
+
+const app = express();
+
+const landingPageHTML = `
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Free Worldwide Tor Proxy</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: linear-gradient(135deg, #1e3c72 0%, #2a5298 100%);
+            color: white;
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 20px;
+        }
+        .container {
+            text-align: center;
+            max-width: 600px;
+            background: rgba(255, 255, 255, 0.1);
+            padding: 40px;
+            border-radius: 20px;
+            backdrop-filter: blur(10px);
+            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
+        }
+        h1 {
+            font-size: 2.5em;
+            margin-bottom: 20px;
+            font-weight: 700;
+        }
+        .info-box {
+            background: rgba(255, 255, 255, 0.15);
+            padding: 20px;
+            border-radius: 10px;
+            margin: 20px 0;
+            text-align: left;
+        }
+        .info-row {
+            display: flex;
+            justify-content: space-between;
+            margin: 10px 0;
+            font-family: 'Courier New', monospace;
+        }
+        .label { font-weight: bold; color: #a8d5ff; }
+        .value { color: #fff; }
+        .warning {
+            background: rgba(255, 193, 7, 0.2);
+            padding: 15px;
+            border-radius: 8px;
+            margin-top: 20px;
+            font-size: 0.9em;
+            border-left: 4px solid #ffc107;
+        }
+        a { color: #a8d5ff; text-decoration: none; }
+        a:hover { text-decoration: underline; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🌐 Free Worldwide Tor Proxy</h1>
+        <p>Anonymous HTTP proxy powered by Tor</p>
+        
+        <div class="info-box">
+            <div class="info-row">
+                <span class="label">Type:</span>
+                <span class="value">HTTP</span>
+            </div>
+            <div class="info-row">
+                <span class="label">Host:</span>
+                <span class="value" id="host">Loading...</span>
+            </div>
+            <div class="info-row">
+                <span class="label">Port:</span>
+                <span class="value" id="port">Loading...</span>
+            </div>
+            <div class="info-row">
+                <span class="label">Username:</span>
+                <span class="value">free</span>
+            </div>
+            <div class="info-row">
+                <span class="label">Password:</span>
+                <span class="value">free</span>
+            </div>
+        </div>
+
+        <div class="warning">
+            ⚠️ <strong>Legal & Ethical Use Only</strong><br>
+            This proxy is for educational and privacy purposes only. Users are responsible for compliance with all applicable laws.
+        </div>
+
+        <p style="margin-top: 20px; font-size: 0.9em;">
+            <a href="/info">API Endpoint</a> • 
+            <a href="/health">Health Check</a>
+        </p>
+    </div>
+
+    <script>
+        fetch('/info')
+            .then(r => r.json())
+            .then(data => {
+                document.getElementById('host').textContent = data.host;
+                document.getElementById('port').textContent = data.port;
+            })
+            .catch(() => {
+                document.getElementById('host').textContent = 'Error';
+                document.getElementById('port').textContent = 'Error';
+            });
+    </script>
+</body>
+</html>
+`;
+
 app.get('/', (req, res) => {
+  res.setHeader('Content-Type', 'text/html');
+  res.send(landingPageHTML);
+});
+
+app.get('/info', (req, res) => {
   res.json({
-    status: 'running',
-    tor: {
-      running: torProcess !== null,
-      bootstrapProgress: torBootstrapProgress
-    },
-    tinyproxy: {
-      running: tinyproxyProcess !== null
-    },
-    ngrok: {
-      running: ngrokUrl !== null,
-      configured: !!NGROK_AUTHTOKEN,
-      staticDomain: NGROK_DOMAIN || 'random',
-      url: ngrokUrl ? ngrokUrl.replace('http://', '').replace('https://', '') : null
-    },
-    ready: isReady,
-    message: isReady ? '✅ All services running' : '⏳ Services starting...'
+    type: 'http',
+    host: state.proxyHost,
+    port: state.proxyPort,
+    user: 'free',
+    pass: 'free'
   });
 });
 
 app.get('/health', (req, res) => {
+  const uptime = Math.floor((Date.now() - state.startTime) / 1000);
+  
   res.json({
     status: 'ok',
-    timestamp: new Date().toISOString(),
-    uptime: process.uptime()
+    services: {
+      tor: state.torRunning,
+      tinyproxy: state.tinyproxyRunning,
+      playit: state.playitRunning
+    },
+    torBootstrap: state.torBootstrapProgress,
+    uptime: uptime,
+    timestamp: new Date().toISOString()
   });
 });
 
-app.get('/info', requireAuth, (req, res) => {
-  if (!isReady) {
-    return res.status(503).json({ error: 'Services not ready yet' });
-  }
+// === Main Startup Sequence ===
 
-  const cleanUrl = ngrokUrl ? ngrokUrl.replace('http://', '').replace('https://', '') : null;
-  const [host, port] = cleanUrl ? cleanUrl.split(':') : [null, '80'];
-
-  res.json({
-    proxy: {
-      type: 'http',
-      host: host,
-      port: port || '80',
-      user: 'toruser',
-      pass: 'torpass123',
-      full_url: ngrokUrl,
-      curl_example: `curl -x http://toruser:torpass123@${host}:${port || '80'} https://check.torproject.org`,
-      wget_example: `wget -e use_proxy=yes -e http_proxy=${host}:${port || '80'} --proxy-user=toruser --proxy-password=torpass123 -O- https://check.torproject.org`
-    },
-    tor: {
-      socksPort: 9050,
-      bootstrapProgress: torBootstrapProgress
-    },
-    tinyproxy: {
-      port: 8888
-    },
-    ngrok: {
-      domain: NGROK_DOMAIN || 'random',
-      authtoken_set: !!NGROK_AUTHTOKEN
-    }
-  });
-});
-
-// Simple proxy endpoint for testing
-app.all('/proxy', async (req, res) => {
+async function startServices() {
   try {
-    const targetUrl = req.query.url;
-    if (!targetUrl) {
-      return res.status(400).json({ error: 'Missing url parameter. Usage: /proxy?url=https://example.com' });
-    }
-
-    const agent = new SocksProxyAgent('socks5://127.0.0.1:9050');
-    const response = await axios.get(targetUrl, {
-      httpAgent: agent,
-      httpsAgent: agent,
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-      },
-      timeout: 30000
-    });
-
-    res.json({
-      status: response.status,
-      url: targetUrl,
-      via_tor: true,
-      preview: response.data.toString().substring(0, 500) + '...'
-    });
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// Cron job to keep service alive (every 5 minutes)
-cron.schedule('*/5 * * * *', async () => {
-  if (!isReady) return;
-
-  try {
-    const agent = new SocksProxyAgent('socks5://127.0.0.1:9050');
-    const randomHeaders = {
-      'User-Agent': `Mozilla/5.0 (${Math.random() > 0.5 ? 'Windows NT 10.0; Win64; x64' : 'Macintosh; Intel Mac OS X 10_15_7'}) AppleWebKit/537.36`,
-      'Accept-Language': `en-US,en;q=0.${Math.floor(Math.random() * 10)}`,
-      'Accept': 'text/html,application/xhtml+xml'
-    };
-
-    await axios.get(`http://localhost:${PORT}/health`, {
-      httpAgent: agent,
-      httpsAgent: agent,
-      headers: randomHeaders,
-      timeout: 10000
-    });
-
-    console.log('✅ Keep-alive ping sent at', new Date().toISOString());
-  } catch (error) {
-    console.error('❌ Keep-alive ping failed:', error.message);
-  }
-});
-
-// Initialize everything
-async function initialize() {
-  try {
-    console.log('🚀 Initializing services...');
+    log('=== Starting Tor → HTTP Proxy ===');
     
-    if (!NGROK_AUTHTOKEN) {
-      console.error('⚠️  CRITICAL: NGROK_AUTHTOKEN not set!');
-      console.error('Get your token from: https://dashboard.ngrok.com/get-started/your-authtoken');
-      console.error('Set it in Render: Dashboard > Service > Environment');
-    }
-    
-    // Start Tor and wait for 100%
+    log('Step 1: Starting Tor...');
     await startTor();
     
-    // Start Tinyproxy
+    log('Step 2: Starting Tinyproxy...');
     await startTinyproxy();
     
-    // Wait a bit for tinyproxy to be ready
-    await new Promise(resolve => setTimeout(resolve, 2000));
+    log('Step 3: Starting Playit agent...');
+    await startPlayit();
     
-    // Start CONNECT proxy wrapper
-    startProxyServer();
+    log('Step 4: Starting Express server...');
+    app.listen(PORT, '0.0.0.0', () => {
+      log(`Express server listening on port ${PORT}`);
+      log('=== All services started successfully! ===');
+      log(`Access the proxy at: http://localhost:${PORT}`);
+      log(`Proxy endpoint: ${state.proxyHost}:${state.proxyPort}`);
+      
+      startKeepalive();
+    });
     
-    // Wait for proxy server
-    await new Promise(resolve => setTimeout(resolve, 1000));
-    
-    // Start Ngrok
-    await startNgrok();
-    
-    if (isReady) {
-      console.log('🎉 All services initialized successfully!');
-      console.log(`📡 Proxy available at: ${ngrokUrl}`);
-      console.log(`👤 Username: toruser`);
-      console.log(`🔑 Password: torpass123`);
-    } else {
-      console.error('⚠️  Services started but ngrok failed');
-    }
   } catch (error) {
-    console.error('❌ Initialization failed:', error.message);
+    log(`FATAL ERROR: ${error.message}`);
+    console.error(error);
     process.exit(1);
   }
 }
 
-// Start Express server
-app.listen(PORT, () => {
-  console.log(`🚀 Express server running on port ${PORT}`);
-  console.log(`📝 Environment check:`);
-  console.log(`   - NGROK_AUTHTOKEN: ${NGROK_AUTHTOKEN ? '✅ Set' : '❌ Missing'}`);
-  console.log(`   - NGROK_DOMAIN: ${NGROK_DOMAIN || '⚠️  Not set (random domain)'}`);
-  console.log(`   - LOGIN_TOKEN: ${LOGIN_TOKEN ? '✅ Set' : '❌ Missing'}`);
-  initialize();
-});
+// === Graceful Shutdown ===
 
-// Graceful shutdown
-process.on('SIGTERM', async () => {
-  console.log('🛑 Shutting down...');
+function shutdown() {
+  log('Shutting down...');
+  
   if (torProcess) torProcess.kill();
   if (tinyproxyProcess) tinyproxyProcess.kill();
-  if (proxyServer) proxyServer.close();
-  if (ngrokListener) await ngrokListener.close();
-  process.exit(0);
-});
+  if (playitProcess) playitProcess.kill();
+  
+  setTimeout(() => process.exit(0), 2000);
+}
 
-process.on('SIGINT', async () => {
-  console.log('🛑 Shutting down...');
-  if (torProcess) torProcess.kill();
-  if (tinyproxyProcess) tinyproxyProcess.kill();
-  if (proxyServer) proxyServer.close();
-  if (ngrokListener) await ngrokListener.close();
-  process.exit(0);
-});
+process.on('SIGTERM', shutdown);
+process.on('SIGINT', shutdown);
+
+// === Start Everything ===
+
+startServices();
 EOF
 
-# Create directories with proper permissions
-RUN mkdir -p /tmp/tor && chmod 700 /tmp/tor
+# Create README.md
+RUN cat > README.md <<'EOF'
+# Free Worldwide Tor → HTTP Proxy
 
-# Expose port
+A single-container application that exposes a public HTTP proxy backed by Tor, designed to run on free PaaS platforms.
+
+## 🎯 Overview
+
+This project creates a fully functional HTTP proxy that routes all traffic through the Tor network for anonymous browsing. It's built as a single Dockerfile with all files embedded using heredoc syntax.
+
+### Architecture
+
+- **Tor**: Provides SOCKS5 proxy for anonymous routing
+- **Tinyproxy**: Converts HTTP requests to Tor's SOCKS5 format
+- **Node.js/Express**: Orchestrates services and provides API endpoints
+- **Playit.gg** (optional): Exposes the proxy publicly via tunneling
+
+## 🚀 Quick Start
+
+### Local Testing
+
+```bash
+# Build the Docker image
+docker build -t tor-http-proxy .
+
+# Run the container
+docker run -p 3000:3000 tor-http-proxy
+
+# Access the landing page
+open http://localhost:3000
+```
+
+### Deploy to Render.com
+
+1. **Create new Web Service** on Render.com
+2. **Choose "Deploy from a Git repository"**
+3. **Connect this repository**
+4. **Configure**:
+   - Environment: Docker
+   - Instance Type: Free
+5. **(Optional) Add environment variable**:
+   - `PLAYIT_SECRET`: Your playit.gg secret key
+6. **Deploy** and wait 5-10 minutes
+
+## 📡 API Endpoints
+
+### `GET /`
+Landing page with proxy information
+
+### `GET /info`
+Returns proxy connection details
+```json
+{
+  "type": "http",
+  "host": "your-host.com",
+  "port": 8888,
+  "user": "free",
+  "pass": "free"
+}
+```
+
+### `GET /health`
+Health check with service status
+```json
+{
+  "status": "ok",
+  "services": {
+    "tor": true,
+    "tinyproxy": true,
+    "playit": false
+  },
+  "torBootstrap": 100,
+  "uptime": 3600
+}
+```
+
+## 🧪 Testing the Proxy
+
+### Using curl
+```bash
+curl -x http://free:free@localhost:8888 http://check.torproject.org
+```
+
+### Using Python
+```python
+import requests
+
+proxies = {
+    'http': 'http://free:free@localhost:8888'
+}
+
+response = requests.get('http://check.torproject.org', proxies=proxies)
+print(response.text)
+```
+
+## 🛡️ Ethical Use & Compliance Statement
+
+**IMPORTANT**: This proxy is designed for legitimate educational, privacy, and research purposes only.
+
+### Intended Use Cases
+- Privacy-conscious browsing
+- Educational demonstrations of Tor technology
+- Testing and development of anonymous applications
+- Research into privacy-enhancing technologies
+
+### Prohibited Uses
+This service **MUST NOT** be used for:
+- Any illegal activities under applicable laws
+- Hacking, unauthorized access, or computer intrusion
+- Distribution of illegal content
+- Harassment, abuse, or harm to others
+
+### User Responsibility
+By using this proxy, you acknowledge that:
+1. You are solely responsible for your use of this service
+2. You will comply with all applicable laws in your jurisdiction
+3. You will respect the rights and terms of service of websites you access
+4. The proxy operator is not responsible for user activities
+
+**By deploying or using this service, you accept full legal responsibility for its operation and use.**
+
+## 🔒 Security Considerations
+
+### What This Proxy Does
+- ✅ Routes traffic through Tor for IP anonymity
+- ✅ Provides basic HTTP proxy functionality
+- ✅ Keeps services alive with periodic health checks
+
+### What This Proxy Does NOT Do
+- ❌ Does NOT encrypt traffic between client and proxy
+- ❌ Does NOT provide strong authentication
+- ❌ Does NOT log or filter malicious requests
+- ❌ Does NOT guarantee anonymity if used improperly
+
+## 🐛 Troubleshooting
+
+### Tor Won't Bootstrap
+- Wait up to 3 minutes (can be slow on some networks)
+- Check logs: `docker logs <container-id>`
+
+### Tinyproxy Connection Refused
+- Ensure Tor is fully bootstrapped first
+- Verify port 8888 is not in use
+
+### PaaS Platform Sleeping
+- Keepalive should prevent this automatically
+- Verify keepalive is running (check logs every 5 minutes)
+
+## ⚠️ Disclaimer
+
+This project is provided "as-is" for educational purposes. The authors and contributors:
+- Make no warranties about reliability, security, or fitness for any purpose
+- Are not responsible for misuse or illegal activities
+- Recommend understanding all applicable laws before deployment
+
+**Use at your own risk.**
+EOF
+
+# Create directories for Tor and logs
+RUN mkdir -p /app/tor-data /app/logs && \
+    chmod 700 /app/tor-data
+
+# Expose the Express server port
 EXPOSE 3000
 
-CMD ["node", "server.js"]
+# Start the application
+CMD ["node", "app.js"]
