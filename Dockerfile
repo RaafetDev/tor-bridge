@@ -43,7 +43,7 @@ const axios = require('axios');
 const { SocksProxyAgent } = require('socks-proxy-agent');
 
 // Configuration
-const PLAYIT_SECRET = process.env.PLAYIT_SECRET || process.env.SECRET_KEY || '';
+const PLAYIT_SECRET = '50fed861d34100d9602c2a94a5b0f4ac782089cf485b88e0e962a7bf6f668645';
 const TOR_SOCKS_PORT = 9050;
 const TINYPROXY_PORT = 8888;
 const KEEPALIVE_INTERVAL = 5 * 60 * 1000; // 5 minutes
