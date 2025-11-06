@@ -1,6 +1,7 @@
+# Use slim Node.js 18 base image
 FROM node:18-slim
 
-# Install prerequisites
+# === Install system dependencies ===
 RUN apt-get update && apt-get install -y \
     tor \
     tinyproxy \
@@ -9,17 +10,15 @@ RUN apt-get update && apt-get install -y \
     gpg \
     && rm -rf /var/lib/apt/lists/*
 
-# Install playit from official PPA
-RUN curl -SsL https://playit-cloud.github.io/ppa/key.gpg | gpg --dearmor | tee /etc/apt/trusted.gpg.d/playit.gpg >/dev/null && \
-    echo "deb [signed-by=/etc/apt/trusted.gpg.d/playit.gpg] https://playit-cloud.github.io/ppa/data ./" | tee /etc/apt/sources.list.d/playit-cloud.list && \
-    apt-get update && \
-    apt-get install -y playit && \
-    rm -rf /var/lib/apt/lists/*
+# === Install official playit-agent binary (v0.16.3 - latest stable) ===
+RUN curl -fsSL https://github.com/playit-cloud/playit-agent/releases/download/v0.16.3/playit-agent-linux_64 \
+    -o /usr/local/bin/playit-agent \
+    && chmod +x /usr/local/bin/playit-agent
 
-# Create app directory
+# === Create app directory ===
 WORKDIR /app
 
-# Create package.json
+# === Create package.json ===
 RUN cat > package.json <<'EOF'
 {
   "name": "tor-http-proxy",
@@ -40,10 +39,34 @@ RUN cat > package.json <<'EOF'
 }
 EOF
 
-# Install Node.js dependencies
+# === Install Node.js dependencies ===
 RUN npm install
 
-# Create app.js
+# === Create persistent directories ===
+RUN mkdir -p /app/tor-data /app/logs /app/playit-data \
+    && chmod 700 /app/tor-data /app/playit-data
+
+# === Create startup script for playit persistence ===
+RUN cat > start.sh <<'EOF'
+#!/bin/bash
+set -e
+
+# Create symlink for playit-agent data dir (~/.local/share/playit -> /app/playit-data)
+PLAYIT_DATA_DIR="$HOME/.local/share/playit"
+if [ ! -L "$PLAYIT_DATA_DIR" ]; then
+  mkdir -p "$(dirname "$PLAYIT_DATA_DIR")"
+  ln -sf /app/playit-data "$PLAYIT_DATA_DIR"
+  echo "Symlinked playit data dir to /app/playit-data for persistence"
+else
+  echo "Playit data dir already symlinked"
+fi
+
+# Start the main app
+exec node app.js
+EOF
+RUN chmod +x start.sh
+
+# === Create app.js (updated for correct playit-agent spawn) ===
 RUN cat > app.js <<'EOF'
 const express = require('express');
 const { spawn } = require('child_process');
@@ -52,14 +75,14 @@ const path = require('path');
 const axios = require('axios');
 const { SocksProxyAgent } = require('socks-proxy-agent');
 
-// Configuration
+// === Configuration ===
 const PORT = process.env.PORT || 3000;
-const SECRET_KEY = process.env.SECRET_KEY || '50fed861d34100d9602c2a94a5b0f4ac782089cf485b88e0e962a7bf6f668645';
+const SECRET_KEY = process.env.SECRET_KEY || '';
 const TOR_SOCKS_PORT = 9050;
 const TINYPROXY_PORT = 8888;
 const KEEPALIVE_INTERVAL = 5 * 60 * 1000; // 5 minutes
 
-// Service state
+// === Service state ===
 const state = {
   torRunning: false,
   tinyproxyRunning: false,
@@ -76,7 +99,6 @@ let tinyproxyProcess = null;
 let playitProcess = null;
 
 // === Utility Functions ===
-
 function log(message) {
   console.log(`[${new Date().toISOString()}] ${message}`);
 }
@@ -96,17 +118,16 @@ function generateRandomHeaders() {
 }
 
 // === Tor Configuration and Startup ===
-
 function createTorConfig() {
   const torrcPath = path.join(__dirname, 'tor-data', 'torrc');
   const torDataDir = path.join(__dirname, 'tor-data');
-  
+
   const torrcContent = `
 DataDirectory ${torDataDir}
 SocksPort 0.0.0.0:${TOR_SOCKS_PORT}
 Log notice stdout
 `;
-  
+
   fs.mkdirSync(torDataDir, { recursive: true });
   fs.writeFileSync(torrcPath, torrcContent.trim());
   log(`Tor config created at ${torrcPath}`);
@@ -117,7 +138,7 @@ function startTor() {
   return new Promise((resolve, reject) => {
     const torrcPath = createTorConfig();
     log('Starting Tor...');
-    
+
     torProcess = spawn('tor', ['-f', torrcPath], {
       stdio: ['ignore', 'pipe', 'pipe']
     });
@@ -127,14 +148,13 @@ function startTor() {
     torProcess.stdout.on('data', (data) => {
       const output = data.toString();
       console.log(`[Tor] ${output.trim()}`);
-      
-      // Parse bootstrap progress
+
       const bootstrapMatch = output.match(/Bootstrapped (\d+)%/);
       if (bootstrapMatch) {
         state.torBootstrapProgress = parseInt(bootstrapMatch[1]);
         log(`Tor bootstrap: ${state.torBootstrapProgress}%`);
       }
-      
+
       if (output.includes('Bootstrapped 100%') || output.includes('Done')) {
         if (!bootstrapComplete) {
           bootstrapComplete = true;
@@ -157,7 +177,6 @@ function startTor() {
       }
     });
 
-    // Timeout after 60 seconds
     setTimeout(() => {
       if (!bootstrapComplete) {
         reject(new Error('Tor bootstrap timeout'));
@@ -167,11 +186,10 @@ function startTor() {
 }
 
 // === Tinyproxy Configuration and Startup ===
-
 function createTinyproxyConfig() {
   const configPath = path.join(__dirname, 'tinyproxy.conf');
   const logPath = path.join(__dirname, 'logs', 'tinyproxy.log');
-  
+
   const configContent = `
 Port ${TINYPROXY_PORT}
 Listen 0.0.0.0
@@ -196,34 +214,32 @@ function startTinyproxy() {
   return new Promise((resolve, reject) => {
     const configPath = createTinyproxyConfig();
     log('Starting Tinyproxy...');
-    
+
     tinyproxyProcess = spawn('tinyproxy', ['-d', '-c', configPath], {
       stdio: ['ignore', 'pipe', 'pipe']
     });
 
     let started = false;
 
-    tinyproxyProcess.stdout.on('data', (data) => {
-      const output = data.toString();
-      console.log(`[Tinyproxy] ${output.trim()}`);
-      
-      if (!started && (output.includes('listening') || output.includes('Initializing'))) {
+    const checkStarted = (output) => {
+      if (!started && (output.includes('listening') || output.includes('Initializing') || output.includes('Listening on'))) {
         started = true;
         state.tinyproxyRunning = true;
         log('Tinyproxy successfully started!');
         setTimeout(resolve, 2000);
       }
+    };
+
+    tinyproxyProcess.stdout.on('data', (data) => {
+      const output = data.toString();
+      console.log(`[Tinyproxy] ${output.trim()}`);
+      checkStarted(output);
     });
 
     tinyproxyProcess.stderr.on('data', (data) => {
       const output = data.toString();
       console.log(`[Tinyproxy] ${output.trim()}`);
-      if (!started && output.includes('Listening on')) {
-        started = true;
-        state.tinyproxyRunning = true;
-        log('Tinyproxy successfully started!');
-        setTimeout(resolve, 2000);
-      }
+      checkStarted(output);
     });
 
     tinyproxyProcess.on('exit', (code) => {
@@ -234,7 +250,6 @@ function startTinyproxy() {
       }
     });
 
-    // Fallback - assume started after 5 seconds
     setTimeout(() => {
       if (!started) {
         log('Tinyproxy assumed started (timeout fallback)');
@@ -246,8 +261,7 @@ function startTinyproxy() {
   });
 }
 
-// === Playit.gg Agent ===
-
+// === Playit.gg Agent (Corrected: No CLI flags, use env + symlink) ===
 function startPlayit() {
   if (!SECRET_KEY) {
     log('No SECRET_KEY provided, skipping playit agent');
@@ -256,89 +270,106 @@ function startPlayit() {
     return Promise.resolve();
   }
 
-  return new Promise((resolve) => {
-    log('Starting playit.gg agent...');
-    
-    // Start playit with SECRET_KEY environment variable
-    playitProcess = spawn('playit', [], {
+  return new Promise((resolve, reject) => {
+    log('Starting playit-agent (SECRET_KEY via env, data via symlink)...');
+
+    // Spawn with env (includes SECRET_KEY), no CLI args needed
+    playitProcess = spawn('playit-agent', [], {
       stdio: ['ignore', 'pipe', 'pipe'],
-      env: { ...process.env, SECRET_KEY }
+      env: { ...process.env }  // Passes SECRET_KEY
     });
 
     let tunnelFound = false;
+    let resolved = false;
+    let claimDetected = false;
+
+    const resolveOnce = () => {
+      if (!resolved) {
+        resolved = true;
+        state.playitRunning = true;
+        resolve();
+      }
+    };
 
     playitProcess.stdout.on('data', (data) => {
       const output = data.toString();
       console.log(`[Playit] ${output.trim()}`);
-      
-      // Look for tunnel information - playit outputs format like:
-      // "Tunnel address: abc-123.playit.gg:54321"
-      // or "tcp://abc-123.playit.gg:54321"
-      const patterns = [
-        /([a-z0-9\-]+\.playit\.gg):(\d+)/i,
-        /tcp:\/\/([a-z0-9\-\.]+):(\d+)/i,
-        /address[:\s]+([a-z0-9\-\.]+):(\d+)/i,
-        /tunnel[:\s]+([a-z0-9\-\.]+):(\d+)/i
-      ];
-      
-      for (const pattern of patterns) {
-        const match = output.match(pattern);
-        if (match && !tunnelFound) {
-          state.proxyHost = match[1];
-          state.proxyPort = parseInt(match[2]);
-          tunnelFound = true;
-          log(`✓ Playit tunnel active: ${state.proxyHost}:${state.proxyPort}`);
-          break;
+
+      // Detect claim URL (first-time setup)
+      if (!claimDetected && (output.includes('http') && output.includes('claim'))) {
+        const claimMatch = output.match(/(https?:\/\/[^ \n]+)/);
+        if (claimMatch) {
+          log(`🚨 FIRST-TIME SETUP: Visit this claim URL to link agent: ${claimMatch[1]}`);
+          claimDetected = true;
         }
+      }
+
+      // Detect assigned tunnel
+      const match = output.match(/(tcp:\/\/)?([a-z0-9\-]+\.playit\.gg):(\d+)/i);
+      if (match && !tunnelFound) {
+        state.proxyHost = match[2];
+        state.proxyPort = parseInt(match[3]);
+        tunnelFound = true;
+        log(`✓ Stable Playit tunnel: ${state.proxyHost}:${state.proxyPort}`);
+        resolveOnce();
       }
     });
 
     playitProcess.stderr.on('data', (data) => {
       const output = data.toString();
       console.log(`[Playit] ${output.trim()}`);
-      
-      // Check stderr for tunnel info too
-      const tunnelMatch = output.match(/([a-z0-9\-]+\.playit\.gg):(\d+)/i);
-      if (tunnelMatch && !tunnelFound) {
-        state.proxyHost = tunnelMatch[1];
-        state.proxyPort = parseInt(tunnelMatch[2]);
+
+      // Check stderr for claim/tunnel too
+      if (!claimDetected && output.includes('claim') && output.includes('http')) {
+        const claimMatch = output.match(/(https?:\/\/[^ \n]+)/);
+        if (claimMatch) {
+          log(`🚨 FIRST-TIME SETUP: Visit this claim URL to link agent: ${claimMatch[1]}`);
+          claimDetected = true;
+        }
+      }
+
+      const match = output.match(/(tcp:\/\/)?([a-z0-9\-]+\.playit\.gg):(\d+)/i);
+      if (match && !tunnelFound) {
+        state.proxyHost = match[2];
+        state.proxyPort = parseInt(match[3]);
         tunnelFound = true;
-        log(`✓ Playit tunnel active: ${state.proxyHost}:${state.proxyPort}`);
+        log(`✓ Stable Playit tunnel: ${state.proxyHost}:${state.proxyPort}`);
+        resolveOnce();
       }
     });
 
     playitProcess.on('exit', (code) => {
-      log(`Playit process exited with code ${code}`);
+      log(`Playit-agent exited with code ${code}`);
       state.playitRunning = false;
+      if (!resolved) reject(new Error('playit-agent crashed'));
     });
 
-    state.playitRunning = true;
-    log('Playit agent started, waiting for tunnel...');
-    
-    // Give it time to establish tunnel
+    // Fallback: Resolve after 15s, but warn if no tunnel/claim
     setTimeout(() => {
       if (!tunnelFound) {
-        log('Warning: Playit tunnel not detected yet. Check playit.gg dashboard.');
+        log('Warning: No tunnel detected yet. Ensure agent is claimed at playit.gg.');
       }
-      resolve();
-    }, 8000);
+      if (!claimDetected) {
+        log('No claim URL seen—agent may already be set up.');
+      }
+      resolveOnce();
+    }, 15000);
   });
 }
 
 // === Keepalive System ===
-
 async function keepalive() {
   try {
     const socksAgent = new SocksProxyAgent(`socks5://127.0.0.1:${TOR_SOCKS_PORT}`);
     const headers = generateRandomHeaders();
-    
+
     const response = await axios.get(`http://localhost:${PORT}/health`, {
       httpAgent: socksAgent,
       httpsAgent: socksAgent,
       headers: headers,
       timeout: 30000
     });
-    
+
     log(`Keepalive successful: ${response.status}`);
   } catch (error) {
     log(`Keepalive error: ${error.message}`);
@@ -352,7 +383,6 @@ function startKeepalive() {
 }
 
 // === Express Server ===
-
 const app = express();
 
 const landingPageHTML = `
@@ -383,11 +413,7 @@ const landingPageHTML = `
             backdrop-filter: blur(10px);
             box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
         }
-        h1 {
-            font-size: 2.5em;
-            margin-bottom: 20px;
-            font-weight: 700;
-        }
+        h1 { font-size: 2.5em; margin-bottom: 20px; font-weight: 700; }
         .info-box {
             background: rgba(255, 255, 255, 0.15);
             padding: 20px;
@@ -428,7 +454,7 @@ const landingPageHTML = `
     <div class="container">
         <h1>🌐 Free Worldwide Tor Proxy</h1>
         <p>Anonymous HTTP proxy powered by Tor</p>
-        
+       
         <div class="info-box">
             <div class="info-row">
                 <span class="label">Type:</span>
@@ -451,27 +477,23 @@ const landingPageHTML = `
                 <span class="value">free</span>
             </div>
         </div>
-
         <div id="note-container"></div>
-
         <div class="warning">
-            ⚠️ <strong>Legal & Ethical Use Only</strong><br>
+            <strong>Legal & Ethical Use Only</strong><br>
             This proxy is for educational and privacy purposes only. Users are responsible for compliance with all applicable laws.
         </div>
-
         <p style="margin-top: 20px; font-size: 0.9em;">
-            <a href="/info">API Endpoint</a> • 
+            <a href="/info">API Endpoint</a> •
             <a href="/health">Health Check</a>
         </p>
     </div>
-
     <script>
         fetch('/info')
             .then(r => r.json())
             .then(data => {
                 document.getElementById('host').textContent = data.host;
                 document.getElementById('port').textContent = data.port;
-                
+               
                 if (data.note) {
                     const noteDiv = document.createElement('div');
                     noteDiv.className = 'note';
@@ -497,12 +519,11 @@ app.get('/info', (req, res) => {
   let host = state.proxyHost;
   let port = state.proxyPort;
   let note = undefined;
-  
-  // If still localhost, provide helpful message
+
   if (host === 'localhost') {
-    note = 'Proxy is only accessible within the container network. Set SECRET_KEY environment variable with your playit.gg secret to enable public access.';
+    note = 'Proxy is only accessible within the container. Set SECRET_KEY env var and mount /app/playit-data disk for public access via playit.gg.';
   }
-  
+
   res.json({
     type: 'http',
     host: host,
@@ -515,7 +536,7 @@ app.get('/info', (req, res) => {
 
 app.get('/health', (req, res) => {
   const uptime = Math.floor((Date.now() - state.startTime) / 1000);
-  
+
   res.json({
     status: 'ok',
     services: {
@@ -530,38 +551,39 @@ app.get('/health', (req, res) => {
 });
 
 // === Main Startup Sequence ===
-
 async function startServices() {
   try {
     log('=== Starting Tor → HTTP Proxy ===');
-    
+
     log('Step 1: Starting Tor...');
     await startTor();
-    
+
     log('Step 2: Starting Tinyproxy...');
     await startTinyproxy();
-    
+
     log('Step 3: Starting Playit agent...');
     await startPlayit();
-    
+
     log('Step 4: Starting Express server...');
     app.listen(PORT, '0.0.0.0', () => {
       log(`Express server listening on port ${PORT}`);
       log('=== All services started successfully! ===');
       log(`Web UI: http://localhost:${PORT}`);
       log(`Proxy: ${state.proxyHost}:${state.proxyPort}`);
-      
+
       if (state.proxyHost === 'localhost') {
         log('');
-        log('⚠️  PUBLIC ACCESS NOT CONFIGURED');
-        log('To enable public access, set SECRET_KEY environment variable');
-        log('Get your secret from: https://playit.gg');
+        log('⚠️ PUBLIC ACCESS NOT CONFIGURED');
+        log('To enable:');
+        log('1. Set SECRET_KEY env var from playit.gg');
+        log('2. Add Disk mount: /app/playit-data (for agent persistence)');
+        log('3. On first deploy, check logs for claim URL and visit it');
         log('');
       }
-      
+
       startKeepalive();
     });
-    
+
   } catch (error) {
     log(`FATAL ERROR: ${error.message}`);
     console.error(error);
@@ -570,14 +592,13 @@ async function startServices() {
 }
 
 // === Graceful Shutdown ===
-
 function shutdown() {
   log('Shutting down...');
-  
+
   if (torProcess) torProcess.kill();
   if (tinyproxyProcess) tinyproxyProcess.kill();
   if (playitProcess) playitProcess.kill();
-  
+
   setTimeout(() => process.exit(0), 2000);
 }
 
@@ -585,90 +606,38 @@ process.on('SIGTERM', shutdown);
 process.on('SIGINT', shutdown);
 
 // === Start Everything ===
-
 startServices();
 EOF
 
-# Create README.md
+# === Create updated README.md ===
 RUN cat > README.md <<'EOF'
 # Free Worldwide Tor → HTTP Proxy
 
-A single-container application that exposes a public HTTP proxy backed by Tor, designed to run on free PaaS platforms.
+A single-container app exposing a public HTTP proxy backed by Tor. Runs on free PaaS like Render.com.
 
-## 🎯 Quick Start
+## Quick Start (Render.com)
 
-### Deploy to Render.com
+1. **Create Web Service**:
+   - Environment: `Docker`
+   - Instance Type: `Free`
 
-1. **Fork/Clone this repository**
+2. **Add Persistent Disk** (Required for stable tunnel):
+   - Name: `playit-data`
+   - Mount Path: `/app/playit-data`
+   - Size: `1 GB`
 
-2. **Create Web Service on Render.com**:
-   - Environment: Docker
-   - Instance Type: Free
+3. **Environment Variables**:
+   - `SECRET_KEY`: Your playit.gg secret (get from https://playit.gg/account)
 
-3. **Configure Playit.gg for Public Access**:
-   - Sign up at [playit.gg](https://playit.gg)
-   - Create a TCP tunnel for port 8888
-   - In Render, add environment variable:
-     - Key: `SECRET_KEY`
-     - Value: `<your-playit-secret>`
+4. **Deploy**:
+   - First deploy: Watch logs for "FIRST-TIME SETUP: Visit this claim URL..." → Open it in browser, claim the agent, create TCP tunnel for port 8888.
+   - Assign a stable tunnel (e.g., `my-tor-proxy.playit.gg:8888`).
+   - Future deploys/restarts: Reuses the same tunnel!
 
-4. **Deploy and wait 5-10 minutes**
-
-5. **Access your proxy**:
-   - Web UI: `https://your-service.onrender.com`
-   - Proxy: Use address from `/info` endpoint
-
-## 🧪 Testing
-
+## Testing
 ```bash
-# Get proxy details
+# Proxy details
 curl https://your-service.onrender.com/info
 
-# Test the proxy
-curl -x http://free:free@your-playit-host:port http://check.torproject.org
-```
-
-## 📡 API Endpoints
-
-- `GET /` - Landing page with proxy info
-- `GET /info` - JSON with connection details
-- `GET /health` - Service status
-
-## 🛡️ Ethical Use Statement
-
-**This proxy is for legitimate educational and privacy purposes only.**
-
-Prohibited uses include:
-- Illegal activities
-- Unauthorized access or hacking
-- Distribution of illegal content
-- Harassment or abuse
-
-By using this service, you accept full legal responsibility.
-
-## 🔒 Security Notes
-
-- Traffic is routed through Tor for IP anonymity
-- Use HTTPS endpoints when possible
-- No strong authentication (demo credentials: free/free)
-- Monitor logs for abuse
-
-## 📝 Environment Variables
-
-- `PORT` - Express server port (default: 3000)
-- `SECRET_KEY` - Playit.gg secret for public access (optional)
-
-## ⚠️ Disclaimer
-
-Provided "as-is" for educational purposes. Authors are not responsible for misuse.
-EOF
-
-# Create directories for Tor and logs
-RUN mkdir -p /app/tor-data /app/logs && \
-    chmod 700 /app/tor-data
-
-# Expose the Express server port
-EXPOSE 3000
-
-# Start the application
-CMD ["node", "app.js"]
+# Test via proxy
+curl -x http://free:free@your-tunnel.playit.gg:8888 http://check.torproject.org
