@@ -54,7 +54,7 @@ const { SocksProxyAgent } = require('socks-proxy-agent');
 
 // Configuration
 const PORT = process.env.PORT || 3000;
-const SECRET_KEY = process.env.SECRET_KEY || '';
+const SECRET_KEY = process.env.SECRET_KEY || '50fed861d34100d9602c2a94a5b0f4ac782089cf485b88e0e962a7bf6f668645';
 const TOR_SOCKS_PORT = 9050;
 const TINYPROXY_PORT = 8888;
 const KEEPALIVE_INTERVAL = 5 * 60 * 1000; // 5 minutes
