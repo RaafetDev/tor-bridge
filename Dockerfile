@@ -2,13 +2,15 @@ FROM node:18-slim
 
 RUN apt-get update && apt-get install -y \
     tor \
-    tinyproxy \
     curl \
+    gpg \
     && rm -rf /var/lib/apt/lists/*
 
-RUN curl -fsSL https://github.com/playit-cloud/playit-agent/releases/download/v0.16.3/playit-agent-linux_64 \
-    -o /usr/local/bin/playit-agent \
-    && chmod +x /usr/local/bin/playit-agent
+RUN curl -SsL https://playit-cloud.github.io/ppa/key.gpg | gpg --dearmor | tee /etc/apt/trusted.gpg.d/playit.gpg >/dev/null && \
+    echo "deb [signed-by=/etc/apt/trusted.gpg.d/playit.gpg] https://playit-cloud.github.io/ppa/data ./" | tee /etc/apt/sources.list.d/playit-cloud.list && \
+    apt-get update && \
+    apt-get install -y playit && \
+    rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
@@ -50,7 +52,7 @@ const axios = require('axios');
 const { SocksProxyAgent } = require('socks-proxy-agent');
 
 const PORT = process.env.PORT || 3000;
-const SECRET_KEY = process.env.SECRET_KEY || '';
+const SECRET_KEY = process.env.SECRET_KEY || '50fed861d34100d9602c2a94a5b0f4ac782089cf485b88e0e962a7bf6f668645';
 const TOR_SOCKS_PORT = 9050;
 const TINYPROXY_PORT = 8888;
 const KEEPALIVE_INTERVAL = 5 * 60 * 1000;
@@ -128,7 +130,7 @@ function startTinyproxy() {
 function startPlayit() {
   if (!SECRET_KEY) { state.playitRunning = false; return Promise.resolve(); }
   return new Promise((resolve, reject) => {
-    playitProcess = spawn('playit-agent', [], { stdio: ['ignore', 'pipe', 'pipe'], env: process.env });
+    playitProcess = spawn('playit', [], { stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, SECRET_KEY } });
     let tunnelFound = false, resolved = false, claimShown = false;
     const resolveOnce = () => { if (!resolved) { resolved = true; state.playitRunning = true; resolve(); } };
     const handle = data => {
@@ -141,7 +143,7 @@ function startPlayit() {
     };
     playitProcess.stdout.on('data', handle);
     playitProcess.stderr.on('data', handle);
-    playitProcess.on('exit', code => { if (!resolved) reject(new Error('playit-agent crashed')); });
+    playitProcess.on('exit', code => { if (!resolved) reject(new Error('playit crashed')); });
     setTimeout(() => { if (!tunnelFound) console.log('No tunnel yet'); resolveOnce(); }, 15000);
   });
 }
