@@ -96,8 +96,6 @@ function createTorConfig() {
   const torrcContent = `
 DataDirectory ${torDataDir}
 SocksPort 0.0.0.0:${TOR_SOCKS_PORT}
-ControlPort 9051
-CookieAuthentication 1
 Log notice stdout
 `;
   
@@ -260,12 +258,23 @@ function startPlayit() {
     
     if (!fs.existsSync(agentPath)) {
       log('Downloading playit agent...');
-      const downloadUrl = 'https://playit.gg/downloads/playit-linux-amd64';
+      // Use GitHub releases for reliable binary download
+      const downloadUrl = 'https://github.com/playit-cloud/playit-agent/releases/latest/download/playit-linux-amd64';
       
-      const downloadProcess = spawn('curl', ['-L', '-o', agentPath, downloadUrl]);
+      const downloadProcess = spawn('wget', ['-O', agentPath, downloadUrl], {
+        stdio: ['ignore', 'pipe', 'pipe']
+      });
+      
+      downloadProcess.stdout.on('data', (data) => {
+        console.log(`[Wget] ${data.toString().trim()}`);
+      });
+      
+      downloadProcess.stderr.on('data', (data) => {
+        console.log(`[Wget] ${data.toString().trim()}`);
+      });
       
       downloadProcess.on('exit', (code) => {
-        if (code === 0) {
+        if (code === 0 && fs.existsSync(agentPath)) {
           fs.chmodSync(agentPath, '755');
           startPlayitProcess(agentPath, resolve);
         } else {
@@ -280,26 +289,50 @@ function startPlayit() {
 }
 
 function startPlayitProcess(agentPath, callback) {
-  playitProcess = spawn(agentPath, ['--secret', PLAYIT_SECRET], {
-    stdio: ['ignore', 'pipe', 'pipe']
+  // Start playit with claim URL to configure tunnel
+  playitProcess = spawn(agentPath, [], {
+    stdio: ['ignore', 'pipe', 'pipe'],
+    env: { ...process.env, PLAYIT_SECRET }
   });
+
+  let tunnelFound = false;
 
   playitProcess.stdout.on('data', (data) => {
     const output = data.toString();
     console.log(`[Playit] ${output.trim()}`);
     
-    const hostMatch = output.match(/host[:\s]+([a-z0-9\-\.]+)/i);
-    const portMatch = output.match(/port[:\s]+(\d+)/i);
+    // Look for tunnel information in various formats
+    // Format 1: "host.playit.gg:12345"
+    const tunnelMatch = output.match(/([a-z0-9\-]+\.playit\.gg):(\d+)/i);
+    if (tunnelMatch && !tunnelFound) {
+      state.proxyHost = tunnelMatch[1];
+      state.proxyPort = parseInt(tunnelMatch[2]);
+      tunnelFound = true;
+      log(`Playit tunnel detected: ${state.proxyHost}:${state.proxyPort}`);
+    }
     
-    if (hostMatch && portMatch) {
-      state.proxyHost = hostMatch[1];
-      state.proxyPort = parseInt(portMatch[1]);
-      log(`Playit tunnel: ${state.proxyHost}:${state.proxyPort}`);
+    // Format 2: Look for "tcp" followed by host and port
+    const tcpMatch = output.match(/tcp.*?([a-z0-9\-]+\.[a-z]+):(\d+)/i);
+    if (tcpMatch && !tunnelFound) {
+      state.proxyHost = tcpMatch[1];
+      state.proxyPort = parseInt(tcpMatch[2]);
+      tunnelFound = true;
+      log(`Playit tunnel detected: ${state.proxyHost}:${state.proxyPort}`);
     }
   });
 
   playitProcess.stderr.on('data', (data) => {
-    console.log(`[Playit] ${data.toString().trim()}`);
+    const output = data.toString();
+    console.log(`[Playit] ${output.trim()}`);
+    
+    // Check stderr for tunnel info too
+    const tunnelMatch = output.match(/([a-z0-9\-]+\.playit\.gg):(\d+)/i);
+    if (tunnelMatch && !tunnelFound) {
+      state.proxyHost = tunnelMatch[1];
+      state.proxyPort = parseInt(tunnelMatch[2]);
+      tunnelFound = true;
+      log(`Playit tunnel detected: ${state.proxyHost}:${state.proxyPort}`);
+    }
   });
 
   playitProcess.on('exit', (code) => {
@@ -309,7 +342,7 @@ function startPlayitProcess(agentPath, callback) {
 
   state.playitRunning = true;
   log('Playit agent started');
-  setTimeout(callback, 3000);
+  setTimeout(callback, 5000); // Give it more time to establish tunnel
 }
 
 // === Keepalive System ===
@@ -463,12 +496,23 @@ app.get('/', (req, res) => {
 });
 
 app.get('/info', (req, res) => {
+  // If no playit configured, use Render's detected URL or localhost
+  let host = state.proxyHost;
+  let port = state.proxyPort;
+  
+  // If still localhost and we have RENDER_EXTERNAL_URL, use that
+  if (host === 'localhost' && process.env.RENDER_EXTERNAL_URL) {
+    host = process.env.RENDER_EXTERNAL_URL.replace(/^https?:\/\//, '');
+    port = 8888; // Render's internal port
+  }
+  
   res.json({
     type: 'http',
-    host: state.proxyHost,
-    port: state.proxyPort,
+    host: host,
+    port: port,
     user: 'free',
-    pass: 'free'
+    pass: 'free',
+    note: host === 'localhost' ? 'Proxy is only accessible within the container network. Configure PLAYIT_SECRET for public access.' : undefined
   });
 });
 
