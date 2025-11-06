@@ -46,7 +46,7 @@ const { SocksProxyAgent } = require('socks-proxy-agent');
 
 // Configuration
 const PORT = process.env.PORT || 3000;
-const PLAYIT_SECRET = process.env.PLAYIT_SECRET || '';
+const PLAYIT_SECRET = process.env.PLAYIT_SECRET || 'c12e88e684c1998eb42f1ae7a399882c8de0ea8aea3498673c31fad28232fc89';
 const TOR_SOCKS_PORT = 9050;
 const TINYPROXY_PORT = 8888;
 const KEEPALIVE_INTERVAL = 5 * 60 * 1000; // 5 minutes
