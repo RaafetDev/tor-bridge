@@ -5,10 +5,8 @@ RUN apt-get update && apt-get install -y \
     tor \
     tinyproxy \
     openssh-client \
-    autossh \
     curl \
     procps \
-    openssl \
     && rm -rf /var/lib/apt/lists/*
 
 # Create user
@@ -34,57 +32,77 @@ const PORT = process.env.PORT || 10000;
 const PROXY_PORT = 8888;
 
 let state = { tor: false, tinyproxy: false, sshTunnel: false, keepalive: false };
-const processes = { tor: null, tinyproxy: null, autossh: null };
+const processes = { tor: null, tinyproxy: null, ssh: null };
 let keepaliveTimer = null;
 
 function log(m) { console.log(`[${new Date().toISOString()}] ${m}`); }
 
-// === Write app.pem from ENV at runtime ===
+// === Write app.pem from ENV ===
 function writeSSHKey() {
     const pem = process.env.SSH_PRIVATE_KEY_PEM;
     if (!pem) {
         log('ERROR: SSH_PRIVATE_KEY_PEM not set');
         process.exit(1);
     }
-    fs.writeFileSync('/app/.ssh/app.pem', pem.trim() + '\n');
-    fs.chmodSync('/app/.ssh/app.pem', '600');
+    fs.writeFileSync('/app/.ssh/app.pem', pem.trim() + '\n', { mode: 0o600 });
     log('app.pem written');
 }
 
-// === Convert PEM → OpenSSH (id_rsa) ===
-function convertKey() {
-    try {
-        execSync('openssl rsa -in /app/.ssh/app.pem -out /app/.ssh/id_rsa -traditional 2>/dev/null', { stdio: 'ignore' });
-        log('PEM → id_rsa converted');
-    } catch (e) {
-        try {
-            execSync('openssl rsa -in /app/.ssh/app.pem -out /app/.ssh/id_rsa', { stdio: 'ignore' });
-            log('PEM → id_rsa (standard)');
-        } catch (e2) {
-            log('Key conversion failed: ' + e2.message);
-            process.exit(1);
-        }
-    }
-    fs.chmodSync('/app/.ssh/id_rsa', '600');
-}
+// === SSH Tunnel (EXACT Portmap.io command) ===
+function setupSSHTunnel() {
+    return new Promise(resolve => {
+        if (processes.ssh) processes.ssh.kill();
 
-// === SSH Config ===
-function setupSSHConfig() {
-    const config = `Host portmap
-    HostName cdns-50919.portmap.host
-    User cdns.first
-    Port 50919
-    IdentityFile /app/.ssh/id_rsa
-    StrictHostKeyChecking no
-    ServerAliveInterval 30
-    ServerAliveCountMax 5
-    ExitOnForwardFailure yes
-    TCPKeepAlive yes
-    IdentitiesOnly yes
-`;
-    fs.writeFileSync('/app/.ssh/config', config);
-    fs.chmodSync('/app/.ssh/config', '600');
-    log('SSH config ready');
+        log('Starting SSH tunnel (Portmap.io style)...');
+        const cmd = 'ssh';
+        const args = [
+            '-i', '/app/.ssh/app.pem',
+            '-o', 'StrictHostKeyChecking=no',
+            '-o', 'ServerAliveInterval=30',
+            '-o', 'ServerAliveCountMax=3',
+            '-o', 'ExitOnForwardFailure=yes',
+            '-o', 'ConnectTimeout=10',
+            '-N',
+            '-R', '50919:localhost:8888',
+            'cdns.first@cdns-50919.portmap.host'
+        ];
+
+        processes.ssh = spawn(cmd, args, { stdio: 'pipe' });
+
+        let connected = false;
+        const timeout = setTimeout(() => {
+            if (!connected) {
+                log('SSH tunnel assumed active (no log)');
+                state.sshTunnel = true;
+                resolve();
+            }
+        }, 60000);
+
+        // Check if port 8888 is listening
+        const checker = setInterval(() => {
+            require('net').createConnection(8888, '127.0.0.1')
+                .on('connect', () => {
+                    if (!connected) {
+                        clearInterval(checker);
+                        clearTimeout(timeout);
+                        connected = true;
+                        state.sshTunnel = true;
+                        log('SSH Tunnel LIVE → cdns-50919.portmap.host:50919');
+                        resolve();
+                    }
+                })
+                .on('error', () => {});
+        }, 3000);
+
+        processes.ssh.stdout.on('data', d => log(`[SSH] ${d}`));
+        processes.ssh.stderr.on('data', d => log(`[SSH ERR] ${d}`));
+
+        processes.ssh.on('exit', (code) => {
+            state.sshTunnel = false;
+            log(`SSH exited (${code || 'unknown'}). Restarting in 10s...`);
+            setTimeout(setupSSHTunnel, 10000);
+        });
+    });
 }
 
 // === Tor ===
@@ -131,55 +149,6 @@ Upstream socks5 127.0.0.1:9050
             resolve();
         }, 3000);
         processes.tinyproxy.on('close', () => { state.tinyproxy = false; });
-    });
-}
-
-// === SSH Tunnel ===
-function setupSSHTunnel() {
-    return new Promise(resolve => {
-        if (processes.autossh) processes.autossh.kill();
-
-        log('Starting SSH reverse tunnel...');
-        processes.autossh = spawn('autossh', [
-            '-M', '0',
-            '-f', '-N',
-            '-o', 'ServerAliveInterval=30',
-            '-o', 'ServerAliveCountMax=5',
-            '-R', '50919:localhost:8888',
-            'portmap'
-        ], { stdio: 'pipe' });
-
-        let connected = false;
-        const timeout = setTimeout(() => {
-            if (!connected) {
-                state.sshTunnel = true;
-                log('SSH tunnel assumed active');
-                resolve();
-            }
-        }, 60000);
-
-        const checker = setInterval(() => {
-            if (processes.autossh && !processes.autossh.killed) {
-                require('net').createConnection(8888, '127.0.0.1')
-                    .on('connect', () => {
-                        if (!connected) {
-                            clearInterval(checker);
-                            clearTimeout(timeout);
-                            connected = true;
-                            state.sshTunnel = true;
-                            log('SSH Tunnel LIVE → cdns-50919.portmap.host:50919');
-                            resolve();
-                        }
-                    })
-                    .on('error', () => {});
-            }
-        }, 5000);
-
-        processes.autossh.on('exit', (code) => {
-            state.sshTunnel = false;
-            log(`SSH died (${code}). Restarting...`);
-            setTimeout(setupSSHTunnel, 10000);
-        });
     });
 }
 
@@ -230,8 +199,6 @@ app.get('/', (req, res) => res.send(`
 async function main() {
     log('Starting...');
     writeSSHKey();
-    convertKey();
-    setupSSHConfig();
     await setupTor();
     await setupTinyproxy();
     await setupSSHTunnel();
@@ -258,7 +225,7 @@ EOF
 RUN cat > /app/entrypoint.sh << 'EOF'
 #!/bin/bash
 set -e
-echo "Tor + SSH Tunnel (app.pem from ENV)"
+echo "Tor + SSH Tunnel (Portmap.io SSH)"
 mkdir -p /app/storage /app/.ssh
 chown proxyuser:proxyuser /app/storage /app/.ssh
 exec node /app/app.js
