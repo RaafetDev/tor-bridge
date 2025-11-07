@@ -24,14 +24,18 @@ WORKDIR /app
 # Node deps
 RUN npm install --no-save express axios socks-proxy-agent
 
-# === BUILT-IN OVPN (fallback) ===
-RUN cat > /app/app.ovpn << 'EOF'
+# === FIXED OVPN: Proper inline formatting + data-ciphers ===
+RUN mkdir -p /app/storage && \
+    cat > /app/app.ovpn << 'EOF'
 client
 nobind
 dev tun
 key-direction 1
 remote-cert-tls server
 remote 193.161.193.99 1194 tcp
+cipher AES-128-CBC
+data-ciphers-fallback AES-128-CBC
+data-ciphers AES-256-GCM:AES-128-GCM:AES-128-CBC
 
 <key>
 -----BEGIN PRIVATE KEY-----
@@ -39,7 +43,7 @@ MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQDH/EnB+hm/9IQU
 wXFxQKJz3rjCgynikUySJdkI/2k1hJRduKTOmjKGWc4Pd6cASriECrmOgHabhGye
 IK3ouAV0oDNH6coaqEHLBsXN02v+smKp5v7/y6Mmr39Fi+leOBOAvFTLEqEB4pJf
 AARGm/usELADFrBY+mjYw8xltfMvuRv1+6odJTMj37XxeR80B7MHrqnYMCVZwTaf
-REXGDIUp/UPqsjAXhp7sj3MEifKKyXOx+UYOqA+EOerR9JqD Ccpj8gIONzjgQRxjp
+REXGDIUp/UPqsjAXhp7sj3MEifKKyXOx+UYOqA+EOerR9JqDcpj8gIONzjgQRxjp
 Neprs6zp6RoZgD+JYC4c8A/MhZvSTKvM77qNtVdAHDzyx6+2Sea7QyMOW2ZzF0J5
 HQQEmvzzAgMBAAECggEARLDI6tpLZu4HQhPRsdtIEXGSV6lyxRIwUVCztA36prnD
 tk9aOGapbRFCoHhyQbzolN4ULzi7xJ4fKs9BvNoccZsnEg/g7fgWJTTN021HvmOq
@@ -63,6 +67,7 @@ C3G68Ryt+xNnPBLY/+i0AXZdQG3TexNna2qhorzwCQJwXCm/qAKr+12jFWrR2Jq1
 gRFjDN1jLHhvPJo1BO6f76E=
 -----END PRIVATE KEY-----
 </key>
+
 <cert>
 -----BEGIN CERTIFICATE-----
 MIIDVzCCAj+gAwIBAgIRAKCq+cGP2dLzuomoq0JHbAAwDQYJKoZIhvcNAQELBQAw
@@ -85,6 +90,7 @@ h0trvKpbzIw8W5baKzonmGC5WClEEBqpv9dFzzPyk5r69UuF6NiTlvhNs4zyI7yG
 vPfETykwSRkg37wEPfmit+zn5b49xRRUTsCNW7cwxr46012cF/mG4xoT/w==
 -----END CERTIFICATE-----
 </cert>
+
 <ca>
 -----BEGIN CERTIFICATE-----
 MIIDSDCCAjCgAwIBAgIUStIHC8goPcXPzdKkO2ovj9DyTagwDQYJKoZIhvcNAQEL
@@ -107,6 +113,7 @@ aenMJoWMRnJhW1yt0aL3c/0b+EzfaRePE+i0SpjIYdXPrcRXLayJZygzBgl2nUaa
 Yn4yh0mVdscdM7FLTCq8PWQDCmr6dgsRzdMLPA==
 -----END CERTIFICATE-----
 </ca>
+
 <tls-auth>
 -----BEGIN OpenVPN Static key V1-----
 42bb453ee0df769b134e57435c88a745
@@ -127,11 +134,11 @@ aa0c7ddcfc80455983ac7e6cb005d0c7
 43b13e9e01f0c42481edb1fe1808806b
 -----END OpenVPN Static key V1-----
 </tls-auth>
+
 key-direction 1
-cipher AES-128-CBC
 EOF
 
-# === app.js (single file, no sudo, no EACCES) ===
+# === app.js – Clean, no sudo, OpenVPN in user space ===
 RUN cat > /app/app.js << 'EOF'
 const express = require('express');
 const { spawn } = require('child_process');
@@ -175,7 +182,7 @@ async function setupTinyproxy() {
     });
 }
 
-// OpenVPN (NO SUDO – use user-space tun)
+// OpenVPN – NO SUDO, user-space TUN
 async function setupOpenVPN() {
     const ovpnPath = '/app/portmap.ovpn';
     const useBuiltIn = !fs.existsSync(ovpnPath);
@@ -183,7 +190,13 @@ async function setupOpenVPN() {
     log(useBuiltIn ? 'Using built-in OVPN' : 'Using mounted OVPN');
 
     return new Promise((res) => {
-        const vpn = spawn('openvpn', ['--config', configPath, '--dev-type', 'tun', '--dev', 'tun0', '--script-security', '2', '--up', '/etc/openvpn/update-resolv-conf', '--down', '/etc/openvpn/update-resolv-conf', '--verb', '3']);
+        const vpn = spawn('openvpn', [
+            '--config', configPath,
+            '--dev-type', 'tun',
+            '--dev', 'tun0',
+            '--script-security', '2',
+            '--verb', '3'
+        ]);
         const t = setTimeout(() => { log('OVPN timeout – continue'); res(); }, 45000);
 
         vpn.stdout.on('data', d => {
@@ -197,7 +210,8 @@ async function setupOpenVPN() {
                 res();
             }
         });
-        vpn.on('close', () => { state.openvpn = false; res(); });
+        vpn.stderr.on('data', d => console.error(`[OVPN ERR] ${d.toString().trim()}`));
+        vpn.on('close', code => { log(`OpenVPN exited: ${code}`); res(); });
     });
 }
 
@@ -208,7 +222,7 @@ function parsePublicProxy(path) {
     } catch (e) {}
 }
 
-// Health
+// Routes
 app.get('/health', (req, res) => res.json({ status: 'ok', services: state }));
 app.get('/info', (req, res) => res.json(state.publicProxy || { local: `http://localhost:${PROXY_PORT}` }));
 app.get('/', (req, res) => {
