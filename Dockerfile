@@ -13,7 +13,7 @@ RUN apt-get update && apt-get install -y \
     sudo \
     && rm -rf /var/lib/apt/lists/*
 
-# Create non-root user for security + fix permissions
+# Create non-root user + fix permissions
 RUN useradd -m -s /bin/bash proxyuser && \
     echo "proxyuser ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers.d/proxyuser && \
     mkdir -p /var/log/tinyproxy /var/run/tinyproxy /app/storage/Tor_Data && \
@@ -81,7 +81,7 @@ XsXvH1KXcobpC1m4IpL8q2t/AJ+hGaQXMBUxEzARBgNVBAMMClBvcnRtYXAgQ0GC
 FErSBwvIKD3Fz83SpDtqL4/Q8k2oMBMGA1UdJQQMMAoGCCsGAQUFBwMCMAsGA1Ud
 DwQEAwIHgDANBgkqhkiG9w0BAQsFAAOCAQEAmE+5exUxS6wJ0K5x64dXlOLq1ikz
 i5X0JrI8iIcwHLrrMSMvKpEQtFUQRp3L1OmDXCgMla76UaoYGp1pb3vHzFJtHkPy
-ash6XE8wdrX1oo7n4RDi7wQx6QoVo5jkkQN28h5P9VmUMm6PIs7qUlQeMzMqbIyN
+ash6XE8wdrX1oo7n4RDi7wQx6QoVo5jkkQN28h5P9VmUMm6PIs7qUlQeMzMqbIyn
 eK6YlqxFHHOTprf0rULeS00PKCh8nvpFJadzzF42ztgGdFM6gVt06SdCb/EiuJYu
 h0trvKpbzIw8W5baKzonmGC5WClEEBqpv9dFzzPyk5r69UuF6NiTlvhNs4zyI7yG
 vPfETykwSRkg37wEPfmit+zn5b49xRRUTsCNW7cwxr46012cF/mG4xoT/w==
@@ -103,7 +103,7 @@ VR0OBBYEFF7F7x9Sl3KG6QtZuCKS/KtrfwCfMFAGA1UdIwRJMEeAFF7F7x9Sl3KG
 xc/N0qQ7ai+P0PJNqDAMBgNVHRMEBTADAQH/MAsGA1UdDwQEAwIBBjANBgkqhkiG
 9w0BAQsFAAOCAQEAHRHTX724CjGcfVcE/AscysAYXlVXmc48vKx9kqJiqyG7+mBt
 gW5aIIqHIDGCyIJD47GRH6E0Rb19opGru53KsHUhiMXeSCmH+N/zew35l3R3cyLZ
-fAHFlqeeLve5g7ozPWgpRoCISVoP8Us2jggwheOYNtTU4C9lVr2ojejmIz2rq03p
+fAHFlqZeeLve5g7ozPWgpRoCISVoP8Us2jggwheOYNtTU4C9lVr2ojejmIz2rq03p
 p6rHY0AfwzZRfN5CQkXAUauVvwo5QupmUQ1z8aBnW9WZLCLu114wpqSqMaTzkD89
 aenMJoWMRnJhW1yt0aL3c/0b+EzfaRePE+i0SpjIYdXPrcRXLayJZygzBgl2nUaa
 Yn4yh0mVdscdM7FLTCq8PWQDCmr6dgsRzdMLPA==
@@ -164,10 +164,15 @@ function log(msg) {
 async function setupTor() {
     return new Promise((resolve, reject) => {
         const torDataDir = '/app/storage/Tor_Data';
-        const torrcPath = '/app/torrc';
+        const torrcPath = '/app/storage/torrc';  // MOVED TO WRITABLE DIR
         const torrcContent = `SocksPort 0.0.0.0:9050\nDataDirectory ${torDataDir}\nLog notice stdout\n`;
-        fs.writeFileSync(torrcPath, torrcContent);
-        log('Generated torrc');
+        try {
+            fs.writeFileSync(torrcPath, torrcContent);
+            log('Generated torrc');
+        } catch (err) {
+            log(`Failed to write torrc: ${err.message}`);
+            return reject(err);
+        }
 
         const tor = spawn('tor', ['-f', torrcPath]);
         const timeout = setTimeout(() => reject(new Error('Tor timeout')), 90000);
@@ -195,7 +200,7 @@ async function setupTor() {
 // Tinyproxy setup
 async function setupTinyproxy() {
     return new Promise((resolve) => {
-        const confPath = '/app/tinyproxy.conf';
+        const confPath = '/app/storage/tinyproxy.conf';  // MOVED TO WRITABLE DIR
         const config = `User proxyuser\nGroup proxyuser\nPort ${PROXY_PORT}\nListen 0.0.0.0\nTimeout 600\nLogFile "/var/log/tinyproxy/tinyproxy.log"\nPidFile "/var/run/tinyproxy/tinyproxy.pid"\nMaxClients 50\nMinSpareServers 2\nMaxSpareServers 10\nStartServers 5\nAllow 0.0.0.0/0\nDisableViaHeader Yes\nUpstream socks5 127.0.0.1:9050\n`;
         fs.writeFileSync(confPath, config);
         log('Generated tinyproxy.conf');
@@ -256,10 +261,6 @@ async function setupOpenVPN() {
         vpn.on('close', code => {
             state.openvpn.running = false;
             log(`OpenVPN exited: ${code}`);
-            setTimeout(() => {
-                state.openvpn.connected = true;
-                resolve();
-            }, 3000);
         });
 
         state.openvpn.running = true;
