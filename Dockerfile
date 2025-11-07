@@ -4,14 +4,7 @@ RUN apt-get update && apt-get install -y \
     tor \
     tinyproxy \
     curl \
-    gpg \
     && rm -rf /var/lib/apt/lists/*
-
-RUN curl -SsL https://playit-cloud.github.io/ppa/key.gpg | gpg --dearmor | tee /etc/apt/trusted.gpg.d/playit.gpg >/dev/null && \
-    echo "deb [signed-by=/etc/apt/trusted.gpg.d/playit.gpg] https://playit-cloud.github.io/ppa/data ./" | tee /etc/apt/sources.list.d/playit-cloud.list && \
-    apt-get update && \
-    apt-get install -y playit && \
-    rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
@@ -53,7 +46,7 @@ const axios = require('axios');
 const { SocksProxyAgent } = require('socks-proxy-agent');
 
 const PORT = process.env.PORT || 3000;
-const SECRET_KEY = process.env.SECRET_KEY || '50fed861d34100d9602c2a94a5b0f4ac782089cf485b88e0e962a7bf6f668645';
+const SECRET_KEY = process.env.SECRET_KEY || '';
 const TOR_SOCKS_PORT = 9050;
 const TINYPROXY_PORT = 8888;
 const KEEPALIVE_INTERVAL = 5 * 60 * 1000;
