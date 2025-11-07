@@ -2,6 +2,7 @@ FROM node:18-slim
 
 RUN apt-get update && apt-get install -y \
     tor \
+    tinyproxy \
     curl \
     gpg \
     && rm -rf /var/lib/apt/lists/*
@@ -96,6 +97,7 @@ function startTor() {
         done = true; state.torRunning = true; resolve();
       }
     });
+    torProcess.on('error', err => { if (!done) reject(err); });
     torProcess.on('exit', code => { if (!done) reject(new Error('Tor failed')); });
     setTimeout(() => { if (!done) reject(new Error('Tor timeout')); }, 60000);
   });
@@ -122,6 +124,7 @@ function startTinyproxy() {
     };
     tinyproxyProcess.stdout.on('data', d => { const o = d.toString(); console.log(`[Tinyproxy] ${o.trim()}`); check(o); });
     tinyproxyProcess.stderr.on('data', d => { const o = d.toString(); console.log(`[Tinyproxy] ${o.trim()}`); check(o); });
+    tinyproxyProcess.on('error', err => { if (!started) reject(err); });
     tinyproxyProcess.on('exit', code => { if (!started) reject(new Error('Tinyproxy failed')); });
     setTimeout(() => { if (!started) { state.tinyproxyRunning = true; resolve(); } }, 5000);
   });
@@ -143,6 +146,7 @@ function startPlayit() {
     };
     playitProcess.stdout.on('data', handle);
     playitProcess.stderr.on('data', handle);
+    playitProcess.on('error', err => { if (!resolved) reject(err); });
     playitProcess.on('exit', code => { if (!resolved) reject(new Error('playit crashed')); });
     setTimeout(() => { if (!tunnelFound) console.log('No tunnel yet'); resolveOnce(); }, 15000);
   });
@@ -177,7 +181,7 @@ async function start() {
     await startTinyproxy();
     await startPlayit();
     app.listen(PORT, '0.0.0.0', () => {});
-  } catch (e) { process.exit(1); }
+  } catch (e) { console.error(e); process.exit(1); }
 }
 process.on('SIGTERM', () => { torProcess?.kill(); tinyproxyProcess?.kill(); playitProcess?.kill(); });
 process.on('SIGINT', () => process.exit(0));
