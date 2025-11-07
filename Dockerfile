@@ -6,41 +6,41 @@ RUN apt-get update && apt-get install -y \
     tinyproxy \
     openvpn \
     curl \
+    wget \
     procps \
     net-tools \
-    iptables \
     iproute2 \
+    iptables \
     sudo \
     && rm -rf /var/lib/apt/lists/*
 
-# Create TUN device directory and setup
+# Setup TUN device support
 RUN mkdir -p /dev/net && \
     mknod /dev/net/tun c 10 200 2>/dev/null || true && \
     chmod 666 /dev/net/tun 2>/dev/null || true
 
-# Create non-root user + writable dirs
+# Create user with sudo privileges
 RUN useradd -m -s /bin/bash proxyuser && \
-    echo "proxyuser ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers.d/proxyuser && \
+    echo "proxyuser ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers && \
     mkdir -p /var/log/tinyproxy /var/run/tinyproxy /app/storage/Tor_Data && \
     chown -R proxyuser:proxyuser /var/log/tinyproxy /var/run/tinyproxy /app/storage
 
 WORKDIR /app
 
-# Node deps
+# Install Node packages
 RUN npm install --no-save express axios socks-proxy-agent
 
-# === FIXED OVPN: Proper inline formatting + data-ciphers ===
+# Create storage directory
 RUN mkdir -p /app/storage
-RUN cat > /app/app.ovpn << 'EOF'
 
+# === OpenVPN Config (Portmap.io) ===
+RUN cat > /app/app.ovpn << 'EOF'
 client
 nobind
 dev tun
 key-direction 1
 remote-cert-tls server
-
 remote 193.161.193.99 1194 tcp
-
 
 <key>
 -----BEGIN PRIVATE KEY-----
@@ -117,9 +117,6 @@ Yn4yh0mVdscdM7FLTCq8PWQDCmr6dgsRzdMLPA==
 -----END CERTIFICATE-----
 </ca>
 <tls-auth>
-#
-# 2048 bit OpenVPN static key
-#
 -----BEGIN OpenVPN Static key V1-----
 42bb453ee0df769b134e57435c88a745
 927d7fd254987077bdf822567410ed73
@@ -140,11 +137,11 @@ aa0c7ddcfc80455983ac7e6cb005d0c7
 -----END OpenVPN Static key V1-----
 </tls-auth>
 key-direction 1
-
 cipher AES-128-CBC
+data-ciphers AES-256-GCM:AES-128-GCM:AES-128-CBC
 EOF
 
-# === app.js – Enhanced with better TUN handling ===
+# === MAIN APP ===
 RUN cat > /app/app.js << 'EOF'
 const express = require('express');
 const { spawn, execSync } = require('child_process');
@@ -153,140 +150,485 @@ const axios = require('axios');
 const { SocksProxyAgent } = require('socks-proxy-agent');
 
 const app = express();
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 10000;
 const PROXY_PORT = 8888;
 
-let state = { tor: false, tinyproxy: false, openvpn: false, publicProxy: null };
+let state = { 
+    tor: false, 
+    tinyproxy: false, 
+    openvpn: false,
+    publicProxy: null,
+    keepaliveActive: false
+};
+
+const processes = { tor: null, tinyproxy: null, openvpn: null };
+let keepaliveTimer = null;
+
 function log(m) { console.log(`[${new Date().toISOString()}] ${m}`); }
 
-// Ensure TUN device exists
-function ensureTunDevice() {
+// Setup TUN device
+function ensureTun() {
     try {
-        if (!fs.existsSync('/dev/net')) {
-            execSync('sudo mkdir -p /dev/net', { stdio: 'inherit' });
-        }
-        if (!fs.existsSync('/dev/net/tun')) {
-            execSync('sudo mknod /dev/net/tun c 10 200', { stdio: 'inherit' });
-            execSync('sudo chmod 666 /dev/net/tun', { stdio: 'inherit' });
-        }
-        log('TUN device ready');
+        execSync('mkdir -p /dev/net 2>/dev/null || true', { stdio: 'ignore' });
+        execSync('mknod /dev/net/tun c 10 200 2>/dev/null || true', { stdio: 'ignore' });
+        execSync('chmod 666 /dev/net/tun 2>/dev/null || true', { stdio: 'ignore' });
+        log('✓ TUN device ready');
     } catch (e) {
-        log(`TUN setup warning: ${e.message}`);
+        log(`⚠ TUN warning: ${e.message}`);
     }
 }
 
-// Tor
-async function setupTor() {
-    return new Promise((res, rej) => {
+// Tor setup
+function setupTor() {
+    return new Promise((resolve, reject) => {
+        if (processes.tor) {
+            log('Tor already running');
+            return resolve();
+        }
+
         const torrc = '/app/storage/torrc';
         fs.writeFileSync(torrc, `SocksPort 0.0.0.0:9050\nDataDirectory /app/storage/Tor_Data\nLog notice stdout\n`);
-        const tor = spawn('tor', ['-f', torrc]);
-        const t = setTimeout(() => rej('timeout'), 90000);
-        tor.stdout.on('data', d => {
-            const l = d.toString();
-            console.log(`[TOR] ${l.trim()}`);
-            if (l.includes('Bootstrapped 100%')) { clearTimeout(t); state.tor = true; log('Tor ready'); res(); }
+        
+        processes.tor = spawn('tor', ['-f', torrc]);
+        const timeout = setTimeout(() => reject('Tor timeout'), 90000);
+        
+        processes.tor.stdout.on('data', d => {
+            const line = d.toString();
+            if (line.includes('Bootstrapped 100%')) {
+                clearTimeout(timeout);
+                state.tor = true;
+                log('✓ Tor connected');
+                resolve();
+            }
         });
-        tor.on('close', () => state.tor = false);
+        
+        processes.tor.on('close', () => {
+            state.tor = false;
+            processes.tor = null;
+            log('Tor closed');
+        });
     });
 }
 
-// Tinyproxy
-async function setupTinyproxy() {
-    return new Promise((res) => {
-        const conf = `/app/storage/tinyproxy.conf`;
-        const cfg = `User proxyuser\nGroup proxyuser\nPort ${PROXY_PORT}\nListen 0.0.0.0\nLogFile "/var/log/tinyproxy/tinyproxy.log"\nPidFile "/var/run/tinyproxy/tinyproxy.pid"\nMaxClients 50\nAllow 0.0.0.0/0\nDisableViaHeader Yes\nUpstream socks5 127.0.0.1:9050\n`;
-        fs.writeFileSync(conf, cfg);
-        const proxy = spawn('tinyproxy', ['-d', '-c', conf]);
-        setTimeout(() => { state.tinyproxy = true; log('Tinyproxy ready'); res(); }, 3000);
-        proxy.stdout.on('data', d => console.log(`[TINYPROXY] ${d.toString().trim()}`));
-        proxy.on('close', () => state.tinyproxy = false);
+// Tinyproxy setup
+function setupTinyproxy() {
+    return new Promise((resolve) => {
+        if (processes.tinyproxy) {
+            log('Tinyproxy already running');
+            return resolve();
+        }
+
+        const conf = '/app/storage/tinyproxy.conf';
+        const config = `User proxyuser
+Group proxyuser
+Port ${PROXY_PORT}
+Listen 0.0.0.0
+LogFile "/var/log/tinyproxy/tinyproxy.log"
+PidFile "/var/run/tinyproxy/tinyproxy.pid"
+MaxClients 100
+Allow 0.0.0.0/0
+DisableViaHeader Yes
+Upstream socks5 127.0.0.1:9050
+`;
+        fs.writeFileSync(conf, config);
+        
+        processes.tinyproxy = spawn('tinyproxy', ['-d', '-c', conf]);
+        
+        setTimeout(() => {
+            state.tinyproxy = true;
+            log('✓ Tinyproxy ready');
+            resolve();
+        }, 3000);
+        
+        processes.tinyproxy.on('close', () => {
+            state.tinyproxy = false;
+            processes.tinyproxy = null;
+            log('Tinyproxy closed');
+        });
     });
 }
 
-// OpenVPN with TUN device check
-async function setupOpenVPN() {
-    ensureTunDevice();
-    
-    const ovpnPath = '/app/portmap.ovpn';
-    const useBuiltIn = !fs.existsSync(ovpnPath);
-    const configPath = useBuiltIn ? '/app/app.ovpn' : ovpnPath;
-    log(useBuiltIn ? 'Using built-in OVPN' : 'Using mounted OVPN');
+// OpenVPN setup
+function setupOpenVPN() {
+    return new Promise((resolve) => {
+        if (processes.openvpn) {
+            log('OpenVPN already running');
+            return resolve();
+        }
 
-    return new Promise((res) => {
-        const vpn = spawn('sudo', [
-            'openvpn',
+        ensureTun();
+        
+        const ovpnPath = '/app/portmap.ovpn';
+        const configPath = fs.existsSync(ovpnPath) ? ovpnPath : '/app/app.ovpn';
+        
+        log(`Using config: ${configPath}`);
+        
+        processes.openvpn = spawn('openvpn', [
             '--config', configPath,
-            '--dev-type', 'tun',
             '--dev', 'tun0',
             '--script-security', '2',
             '--verb', '3'
         ]);
-        const t = setTimeout(() => { log('OVPN timeout – continuing without VPN'); res(); }, 45000);
-
-        vpn.stdout.on('data', d => {
-            const l = d.toString();
-            console.log(`[OVPN] ${l.trim()}`);
-            if (l.includes('Initialization Sequence Completed')) {
-                clearTimeout(t);
+        
+        const timeout = setTimeout(() => {
+            log('OpenVPN timeout - continuing');
+            resolve();
+        }, 45000);
+        
+        processes.openvpn.stdout.on('data', d => {
+            const line = d.toString();
+            console.log(`[VPN] ${line.trim()}`);
+            if (line.includes('Initialization Sequence Completed')) {
+                clearTimeout(timeout);
                 state.openvpn = true;
                 parsePublicProxy(configPath);
-                log('OpenVPN connected');
-                res();
+                log('✓ OpenVPN connected');
+                resolve();
             }
         });
-        vpn.stderr.on('data', d => console.error(`[OVPN ERR] ${d.toString().trim()}`));
-        vpn.on('close', code => { 
-            log(`OpenVPN exited: ${code}`); 
-            if (code !== 0) state.openvpn = false;
-            res(); 
+        
+        processes.openvpn.stderr.on('data', d => {
+            console.error(`[VPN ERR] ${d.toString().trim()}`);
+        });
+        
+        processes.openvpn.on('close', code => {
+            state.openvpn = false;
+            processes.openvpn = null;
+            log(`OpenVPN closed: ${code}`);
+            resolve();
         });
     });
 }
 
+// Parse public proxy info from OVPN
 function parsePublicProxy(path) {
     try {
-        const m = fs.readFileSync(path, 'utf8').match(/remote\s+([^\s]+)\s+(\d+)/);
-        if (m) state.publicProxy = { host: m[1], port: +m[2], user: 'free', pass: 'free' };
-    } catch (e) {}
+        const content = fs.readFileSync(path, 'utf8');
+        const match = content.match(/remote\s+([^\s]+)\s+(\d+)/);
+        if (match) {
+            state.publicProxy = {
+                host: match[1],
+                port: parseInt(match[2]),
+                type: 'http',
+                username: 'free',
+                password: 'free'
+            };
+            log(`✓ Public proxy: ${match[1]}:${match[2]}`);
+        }
+    } catch (e) {
+        log(`Parse proxy error: ${e.message}`);
+    }
+}
+
+// Keep-alive job to prevent Render sleep
+async function keepAlive() {
+    if (!state.keepaliveActive) return;
+    
+    try {
+        const agent = new SocksProxyAgent('socks5://127.0.0.1:9050');
+        const sites = [
+            'https://www.google.com',
+            'https://www.wikipedia.org',
+            'https://www.github.com',
+            'https://www.stackoverflow.com'
+        ];
+        
+        const site = sites[Math.floor(Math.random() * sites.length)];
+        const response = await axios.get(site, {
+            httpAgent: agent,
+            httpsAgent: agent,
+            timeout: 15000,
+            headers: {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+            }
+        });
+        
+        log(`✓ Keep-alive: ${site} [${response.status}]`);
+    } catch (e) {
+        log(`⚠ Keep-alive failed: ${e.message}`);
+    }
+}
+
+// Start keep-alive job
+function startKeepAlive() {
+    if (keepaliveTimer) return;
+    
+    state.keepaliveActive = true;
+    keepaliveTimer = setInterval(() => keepAlive(), 5 * 60 * 1000); // Every 5 minutes
+    log('✓ Keep-alive job started (5min interval)');
+    
+    // Initial run after 30s
+    setTimeout(() => keepAlive(), 30000);
 }
 
 // Routes
-app.get('/health', (req, res) => res.json({ status: 'ok', services: state }));
-app.get('/info', (req, res) => res.json(state.publicProxy || { local: `http://localhost:${PROXY_PORT}` }));
-app.get('/', (req, res) => {
-    const p = state.publicProxy || { host: 'localhost', port: PROXY_PORT, user: 'free', pass: 'free' };
-    const vpnStatus = state.openvpn ? '✓ VPN Connected' : '✗ VPN Unavailable (Tor only)';
-    res.send(`<!DOCTYPE html><html><head><title>Tor Proxy</title><style>body{font-family:Arial;background:#1e3c72;color:#fff;padding:40px;text-align:center;}.status{color:#a0f7a0;}.warn{color:#f7a0a0;}</style></head><body><div style="background:rgba(255,255,255,0.1);padding:30px;border-radius:15px;max-width:500px;margin:auto;"><h1>🧅 Tor HTTP Proxy</h1><p><strong>Host:</strong> ${p.host}<br><strong>Port:</strong> ${p.port}<br><strong>User:</strong> free<br><strong>Pass:</strong> free</p><p class="${state.openvpn ? 'status' : 'warn'}">${vpnStatus}</p><p class="status">✓ Tor Network Active</p></div></body></html>`);
+app.get('/health', (req, res) => {
+    res.json({ 
+        status: state.tor && state.tinyproxy ? 'healthy' : 'degraded',
+        services: state 
+    });
 });
 
-// Start
+app.get('/info', (req, res) => {
+    res.json(state.publicProxy || { error: 'No public proxy available' });
+});
+
+app.get('/', (req, res) => {
+    const proxy = state.publicProxy;
+    const status = state.openvpn ? 'success' : 'warning';
+    const statusText = state.openvpn ? '✓ CONNECTED' : '⚠ VPN Unavailable';
+    
+    res.send(`<!DOCTYPE html>
+<html>
+<head>
+    <title>🧅 Tor Proxy Service</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: #fff;
+            min-height: 100vh;
+            padding: 20px;
+        }
+        .container {
+            max-width: 800px;
+            margin: 40px auto;
+            background: rgba(255,255,255,0.1);
+            backdrop-filter: blur(20px);
+            border-radius: 20px;
+            padding: 40px;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+        }
+        h1 {
+            font-size: 3em;
+            text-align: center;
+            margin-bottom: 10px;
+            text-shadow: 2px 2px 4px rgba(0,0,0,0.3);
+        }
+        .subtitle {
+            text-align: center;
+            opacity: 0.9;
+            margin-bottom: 40px;
+            font-size: 1.2em;
+        }
+        .status-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 15px;
+            margin-bottom: 30px;
+        }
+        .status-card {
+            background: rgba(255,255,255,0.15);
+            padding: 20px;
+            border-radius: 15px;
+            text-align: center;
+        }
+        .status-card .icon { font-size: 2em; margin-bottom: 10px; }
+        .status-card .label { opacity: 0.8; font-size: 0.9em; }
+        .status-card .value { 
+            font-size: 1.2em; 
+            font-weight: bold; 
+            margin-top: 5px;
+        }
+        .success { color: #4ade80; }
+        .warning { color: #fbbf24; }
+        .proxy-box {
+            background: rgba(0,0,0,0.3);
+            padding: 30px;
+            border-radius: 15px;
+            margin: 30px 0;
+        }
+        .proxy-box h2 {
+            margin-bottom: 20px;
+            font-size: 1.5em;
+        }
+        .proxy-info {
+            display: grid;
+            grid-template-columns: 120px 1fr;
+            gap: 15px;
+            font-family: 'Monaco', 'Courier New', monospace;
+            font-size: 1.1em;
+        }
+        .proxy-info .key { opacity: 0.8; }
+        .proxy-info .val { 
+            font-weight: bold;
+            color: #4ade80;
+        }
+        .usage-section {
+            background: rgba(255,255,255,0.1);
+            padding: 25px;
+            border-radius: 15px;
+            margin-top: 20px;
+        }
+        .usage-section h3 {
+            margin-bottom: 15px;
+        }
+        .code {
+            background: rgba(0,0,0,0.4);
+            padding: 15px;
+            border-radius: 8px;
+            font-family: 'Monaco', monospace;
+            font-size: 0.9em;
+            overflow-x: auto;
+            margin-top: 10px;
+        }
+        .badge {
+            display: inline-block;
+            padding: 5px 15px;
+            border-radius: 20px;
+            font-size: 0.85em;
+            font-weight: bold;
+            margin-top: 10px;
+        }
+        .badge.active { background: #4ade80; color: #000; }
+        @media (max-width: 768px) {
+            h1 { font-size: 2em; }
+            .container { padding: 25px; }
+            .proxy-info { grid-template-columns: 1fr; gap: 10px; }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🧅 Tor Proxy</h1>
+        <p class="subtitle">Worldwide Anonymous HTTP Proxy</p>
+        
+        <div class="status-grid">
+            <div class="status-card">
+                <div class="icon">🌐</div>
+                <div class="label">Tor Network</div>
+                <div class="value ${state.tor ? 'success' : 'warning'}">
+                    ${state.tor ? '✓ Connected' : '⚠ Offline'}
+                </div>
+            </div>
+            <div class="status-card">
+                <div class="icon">🔄</div>
+                <div class="label">HTTP Proxy</div>
+                <div class="value ${state.tinyproxy ? 'success' : 'warning'}">
+                    ${state.tinyproxy ? '✓ Running' : '⚠ Stopped'}
+                </div>
+            </div>
+            <div class="status-card">
+                <div class="icon">🔐</div>
+                <div class="label">VPN Tunnel</div>
+                <div class="value ${status}">
+                    ${statusText}
+                </div>
+            </div>
+            <div class="status-card">
+                <div class="icon">⏱️</div>
+                <div class="label">Keep-Alive</div>
+                <div class="value success">
+                    ✓ Active
+                </div>
+            </div>
+        </div>
+
+        ${proxy ? `
+        <div class="proxy-box">
+            <h2>🌍 Public HTTP Proxy</h2>
+            <div class="proxy-info">
+                <div class="key">Type:</div>
+                <div class="val">HTTP</div>
+                <div class="key">Host:</div>
+                <div class="val">${proxy.host}</div>
+                <div class="key">Port:</div>
+                <div class="val">${proxy.port}</div>
+                <div class="key">Username:</div>
+                <div class="val">${proxy.username}</div>
+                <div class="key">Password:</div>
+                <div class="val">${proxy.password}</div>
+            </div>
+            <span class="badge active">FREE WORLDWIDE ACCESS</span>
+        </div>
+
+        <div class="usage-section">
+            <h3>🐍 Python Usage</h3>
+            <div class="code">proxies = {<br>&nbsp;&nbsp;'http': 'http://${proxy.username}:${proxy.password}@${proxy.host}:${proxy.port}',<br>&nbsp;&nbsp;'https': 'http://${proxy.username}:${proxy.password}@${proxy.host}:${proxy.port}'<br>}<br>r = requests.get('https://ipinfo.io/json', proxies=proxies)<br>print(r.json())</div>
+        </div>
+
+        <div class="usage-section">
+            <h3>💻 cURL Usage</h3>
+            <div class="code">curl -x http://${proxy.username}:${proxy.password}@${proxy.host}:${proxy.port} https://ipinfo.io/json</div>
+        </div>
+
+        <div class="usage-section">
+            <h3>🦊 Firefox Setup</h3>
+            <div class="code">Settings → Network Settings → Manual proxy<br>HTTP Proxy: ${proxy.host}<br>Port: ${proxy.port}<br>Username: ${proxy.username}<br>Password: ${proxy.password}</div>
+        </div>
+        ` : `
+        <div class="proxy-box">
+            <h2>⚠️ Public Proxy Unavailable</h2>
+            <p style="opacity: 0.8;">VPN tunnel is establishing connection. Tor proxy still working internally.</p>
+        </div>
+        `}
+    </div>
+</body>
+</html>`);
+});
+
+// Main startup
 async function main() {
-    log('Starting services...');
-    await setupTor();
-    await setupTinyproxy();
-    await setupOpenVPN();
-    app.listen(PORT, '0.0.0.0', () => {
-        log(`UI: http://0.0.0.0:${PORT}`);
-        log(`Proxy: http://0.0.0.0:${PROXY_PORT}`);
-        log('All ready');
-    });
+    log('════════════════════════════════════════');
+    log('   🧅 TOR PROXY SERVICE - IA V99');
+    log('════════════════════════════════════════');
+    
+    try {
+        // Start services in sequence
+        await setupTor();
+        await setupTinyproxy();
+        await setupOpenVPN();
+        
+        // Start keep-alive
+        startKeepAlive();
+        
+        // Start web server
+        app.listen(PORT, '0.0.0.0', () => {
+            log('════════════════════════════════════════');
+            log(`✓ Web UI: http://0.0.0.0:${PORT}`);
+            log(`✓ Local Proxy: http://0.0.0.0:${PROXY_PORT}`);
+            if (state.publicProxy) {
+                log(`✓ Public Proxy: ${state.publicProxy.host}:${state.publicProxy.port}`);
+            }
+            log('════════════════════════════════════════');
+            log('🎉 ALL SYSTEMS READY!');
+        });
+    } catch (e) {
+        log(`❌ FATAL: ${e.message}`);
+        process.exit(1);
+    }
 }
-main().catch(e => { log('FATAL: ' + e.message); process.exit(1); });
+
+// Graceful shutdown
+process.on('SIGTERM', () => {
+    log('Shutting down gracefully...');
+    if (keepaliveTimer) clearInterval(keepaliveTimer);
+    Object.values(processes).forEach(p => p && p.kill());
+    process.exit(0);
+});
+
+main();
 EOF
 
 # Entrypoint
 RUN cat > /app/entrypoint.sh << 'EOF'
 #!/bin/bash
 set -e
-echo "=== Tor Proxy Starting ==="
-[ -f /app/portmap.ovpn ] && echo "Using mounted OVPN" || echo "Using built-in OVPN"
+echo "════════════════════════════════════════"
+echo "   🧅 TOR PROXY - IA V99"
+echo "   Think Outside The Box"
+echo "════════════════════════════════════════"
+echo ""
 exec node /app/app.js
 EOF
 RUN chmod +x /app/entrypoint.sh
 
-EXPOSE 3000 8888
-HEALTHCHECK --interval=30s --timeout=10s --start-period=60s CMD curl -f http://localhost:3000/health || exit 1
+EXPOSE 10000
+HEALTHCHECK --interval=30s --timeout=10s --start-period=90s \
+    CMD curl -f http://localhost:${PORT:-10000}/health || exit 1
+
 ENV NODE_ENV=production
 USER proxyuser
 ENTRYPOINT ["/app/entrypoint.sh"]
