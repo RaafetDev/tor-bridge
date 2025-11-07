@@ -13,6 +13,11 @@ RUN apt-get update && apt-get install -y \
     sudo \
     && rm -rf /var/lib/apt/lists/*
 
+# Create TUN device directory and setup
+RUN mkdir -p /dev/net && \
+    mknod /dev/net/tun c 10 200 2>/dev/null || true && \
+    chmod 666 /dev/net/tun 2>/dev/null || true
+
 # Create non-root user + writable dirs
 RUN useradd -m -s /bin/bash proxyuser && \
     echo "proxyuser ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers.d/proxyuser && \
@@ -139,10 +144,10 @@ key-direction 1
 cipher AES-128-CBC
 EOF
 
-# === app.js – Clean, no sudo, OpenVPN in user space ===
+# === app.js – Enhanced with better TUN handling ===
 RUN cat > /app/app.js << 'EOF'
 const express = require('express');
-const { spawn } = require('child_process');
+const { spawn, execSync } = require('child_process');
 const fs = require('fs');
 const axios = require('axios');
 const { SocksProxyAgent } = require('socks-proxy-agent');
@@ -153,6 +158,22 @@ const PROXY_PORT = 8888;
 
 let state = { tor: false, tinyproxy: false, openvpn: false, publicProxy: null };
 function log(m) { console.log(`[${new Date().toISOString()}] ${m}`); }
+
+// Ensure TUN device exists
+function ensureTunDevice() {
+    try {
+        if (!fs.existsSync('/dev/net')) {
+            execSync('sudo mkdir -p /dev/net', { stdio: 'inherit' });
+        }
+        if (!fs.existsSync('/dev/net/tun')) {
+            execSync('sudo mknod /dev/net/tun c 10 200', { stdio: 'inherit' });
+            execSync('sudo chmod 666 /dev/net/tun', { stdio: 'inherit' });
+        }
+        log('TUN device ready');
+    } catch (e) {
+        log(`TUN setup warning: ${e.message}`);
+    }
+}
 
 // Tor
 async function setupTor() {
@@ -183,22 +204,25 @@ async function setupTinyproxy() {
     });
 }
 
-// OpenVPN – NO SUDO, user-space TUN
+// OpenVPN with TUN device check
 async function setupOpenVPN() {
+    ensureTunDevice();
+    
     const ovpnPath = '/app/portmap.ovpn';
     const useBuiltIn = !fs.existsSync(ovpnPath);
     const configPath = useBuiltIn ? '/app/app.ovpn' : ovpnPath;
     log(useBuiltIn ? 'Using built-in OVPN' : 'Using mounted OVPN');
 
     return new Promise((res) => {
-        const vpn = spawn('openvpn', [
+        const vpn = spawn('sudo', [
+            'openvpn',
             '--config', configPath,
             '--dev-type', 'tun',
             '--dev', 'tun0',
             '--script-security', '2',
             '--verb', '3'
         ]);
-        const t = setTimeout(() => { log('OVPN timeout – continue'); res(); }, 45000);
+        const t = setTimeout(() => { log('OVPN timeout – continuing without VPN'); res(); }, 45000);
 
         vpn.stdout.on('data', d => {
             const l = d.toString();
@@ -212,7 +236,11 @@ async function setupOpenVPN() {
             }
         });
         vpn.stderr.on('data', d => console.error(`[OVPN ERR] ${d.toString().trim()}`));
-        vpn.on('close', code => { log(`OpenVPN exited: ${code}`); res(); });
+        vpn.on('close', code => { 
+            log(`OpenVPN exited: ${code}`); 
+            if (code !== 0) state.openvpn = false;
+            res(); 
+        });
     });
 }
 
@@ -228,7 +256,8 @@ app.get('/health', (req, res) => res.json({ status: 'ok', services: state }));
 app.get('/info', (req, res) => res.json(state.publicProxy || { local: `http://localhost:${PROXY_PORT}` }));
 app.get('/', (req, res) => {
     const p = state.publicProxy || { host: 'localhost', port: PROXY_PORT, user: 'free', pass: 'free' };
-    res.send(`<!DOCTYPE html><html><head><title>Tor Proxy</title><style>body{font-family:Arial;background:#1e3c72;color:#fff;padding:40px;text-align:center;}</style></head><body><div style="background:rgba(255,255,255,0.1);padding:30px;border-radius:15px;max-width:500px;margin:auto;"><h1>Tor HTTP Proxy</h1><p><strong>Host:</strong> ${p.host}<br><strong>Port:</strong> ${p.port}<br><strong>User:</strong> free<br><strong>Pass:</strong> free</p><p style="color:#a0f7a0;">Via Tor</p></div></body></html>`);
+    const vpnStatus = state.openvpn ? '✓ VPN Connected' : '✗ VPN Unavailable (Tor only)';
+    res.send(`<!DOCTYPE html><html><head><title>Tor Proxy</title><style>body{font-family:Arial;background:#1e3c72;color:#fff;padding:40px;text-align:center;}.status{color:#a0f7a0;}.warn{color:#f7a0a0;}</style></head><body><div style="background:rgba(255,255,255,0.1);padding:30px;border-radius:15px;max-width:500px;margin:auto;"><h1>🧅 Tor HTTP Proxy</h1><p><strong>Host:</strong> ${p.host}<br><strong>Port:</strong> ${p.port}<br><strong>User:</strong> free<br><strong>Pass:</strong> free</p><p class="${state.openvpn ? 'status' : 'warn'}">${vpnStatus}</p><p class="status">✓ Tor Network Active</p></div></body></html>`);
 });
 
 // Start
