@@ -1,6 +1,6 @@
 FROM node:18-bullseye-slim
 
-# Install system dependencies
+# Install system deps
 RUN apt-get update && apt-get install -y \
     tor \
     tinyproxy \
@@ -13,26 +13,24 @@ RUN apt-get update && apt-get install -y \
     sudo \
     && rm -rf /var/lib/apt/lists/*
 
-# Create non-root user + fix permissions
+# Create non-root user + writable dirs
 RUN useradd -m -s /bin/bash proxyuser && \
     echo "proxyuser ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers.d/proxyuser && \
     mkdir -p /var/log/tinyproxy /var/run/tinyproxy /app/storage/Tor_Data && \
     chown -R proxyuser:proxyuser /var/log/tinyproxy /var/run/tinyproxy /app/storage
 
-# Set working directory
 WORKDIR /app
 
-# Install Node.js dependencies
+# Node deps
 RUN npm install --no-save express axios socks-proxy-agent
 
-# === KEEP: Create app.ovpn config file ===
+# === BUILT-IN OVPN (fallback) ===
 RUN cat > /app/app.ovpn << 'EOF'
 client
 nobind
 dev tun
 key-direction 1
 remote-cert-tls server
-
 remote 193.161.193.99 1194 tcp
 
 <key>
@@ -41,7 +39,7 @@ MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQDH/EnB+hm/9IQU
 wXFxQKJz3rjCgynikUySJdkI/2k1hJRduKTOmjKGWc4Pd6cASriECrmOgHabhGye
 IK3ouAV0oDNH6coaqEHLBsXN02v+smKp5v7/y6Mmr39Fi+leOBOAvFTLEqEB4pJf
 AARGm/usELADFrBY+mjYw8xltfMvuRv1+6odJTMj37XxeR80B7MHrqnYMCVZwTaf
-REXGDIUp/UPqsjAXhp7sj3MEifKKyXOx+UYOqA+EOerR9JqDcpj8gIONzjgQRxjp
+REXGDIUp/UPqsjAXhp7sj3MEifKKyXOx+UYOqA+EOerR9JqD Ccpj8gIONzjgQRxjp
 Neprs6zp6RoZgD+JYC4c8A/MhZvSTKvM77qNtVdAHDzyx6+2Sea7QyMOW2ZzF0J5
 HQQEmvzzAgMBAAECggEARLDI6tpLZu4HQhPRsdtIEXGSV6lyxRIwUVCztA36prnD
 tk9aOGapbRFCoHhyQbzolN4ULzi7xJ4fKs9BvNoccZsnEg/g7fgWJTTN021HvmOq
@@ -130,255 +128,121 @@ aa0c7ddcfc80455983ac7e6cb005d0c7
 -----END OpenVPN Static key V1-----
 </tls-auth>
 key-direction 1
-
 cipher AES-128-CBC
 EOF
 
-# === Create app.js (single file, no duplicates) ===
+# === app.js (single file, no sudo, no EACCES) ===
 RUN cat > /app/app.js << 'EOF'
 const express = require('express');
 const { spawn } = require('child_process');
 const fs = require('fs');
-const path = require('path');
 const axios = require('axios');
 const { SocksProxyAgent } = require('socks-proxy-agent');
-const crypto = require('crypto');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 const PROXY_PORT = 8888;
 
-// State
-let state = {
-    tor: { running: false, bootstrapped: false },
-    tinyproxy: { running: false },
-    openvpn: { running: false, connected: false },
-    publicProxy: null
-};
+let state = { tor: false, tinyproxy: false, openvpn: false, publicProxy: null };
+function log(m) { console.log(`[${new Date().toISOString()}] ${m}`); }
 
-function log(msg) {
-    console.log(`[${new Date().toISOString()}] ${msg}`);
-}
-
-// Tor setup
+// Tor
 async function setupTor() {
-    return new Promise((resolve, reject) => {
-        const torDataDir = '/app/storage/Tor_Data';
-        const torrcPath = '/app/storage/torrc';  // MOVED TO WRITABLE DIR
-        const torrcContent = `SocksPort 0.0.0.0:9050\nDataDirectory ${torDataDir}\nLog notice stdout\n`;
-        try {
-            fs.writeFileSync(torrcPath, torrcContent);
-            log('Generated torrc');
-        } catch (err) {
-            log(`Failed to write torrc: ${err.message}`);
-            return reject(err);
-        }
-
-        const tor = spawn('tor', ['-f', torrcPath]);
-        const timeout = setTimeout(() => reject(new Error('Tor timeout')), 90000);
-
-        tor.stdout.on('data', data => {
-            const line = data.toString();
-            console.log(`[TOR] ${line.trim()}`);
-            if (line.includes('Bootstrapped 100%')) {
-                clearTimeout(timeout);
-                state.tor.bootstrapped = true;
-                log('Tor bootstrapped');
-                resolve();
-            }
+    return new Promise((res, rej) => {
+        const torrc = '/app/storage/torrc';
+        fs.writeFileSync(torrc, `SocksPort 0.0.0.0:9050\nDataDirectory /app/storage/Tor_Data\nLog notice stdout\n`);
+        const tor = spawn('tor', ['-f', torrc]);
+        const t = setTimeout(() => rej('timeout'), 90000);
+        tor.stdout.on('data', d => {
+            const l = d.toString();
+            console.log(`[TOR] ${l.trim()}`);
+            if (l.includes('Bootstrapped 100%')) { clearTimeout(t); state.tor = true; log('Tor ready'); res(); }
         });
-
-        tor.stderr.on('data', data => console.error(`[TOR ERR] ${data.toString().trim()}`));
-        tor.on('close', code => {
-            state.tor.running = false;
-            log(`Tor exited: ${code}`);
-        });
-        state.tor.running = true;
+        tor.on('close', () => state.tor = false);
     });
 }
 
-// Tinyproxy setup
+// Tinyproxy
 async function setupTinyproxy() {
-    return new Promise((resolve) => {
-        const confPath = '/app/storage/tinyproxy.conf';  // MOVED TO WRITABLE DIR
-        const config = `User proxyuser\nGroup proxyuser\nPort ${PROXY_PORT}\nListen 0.0.0.0\nTimeout 600\nLogFile "/var/log/tinyproxy/tinyproxy.log"\nPidFile "/var/run/tinyproxy/tinyproxy.pid"\nMaxClients 50\nMinSpareServers 2\nMaxSpareServers 10\nStartServers 5\nAllow 0.0.0.0/0\nDisableViaHeader Yes\nUpstream socks5 127.0.0.1:9050\n`;
-        fs.writeFileSync(confPath, config);
-        log('Generated tinyproxy.conf');
-
-        const proxy = spawn('tinyproxy', ['-d', '-c', confPath]);
-        const timeout = setTimeout(() => {
-            state.tinyproxy.running = true;
-            resolve();
-        }, 5000);
-
-        proxy.stdout.on('data', data => {
-            const line = data.toString().trim();
-            console.log(`[TINYPROXY] ${line}`);
-            if (line.includes('Listening')) {
-                clearTimeout(timeout);
-                state.tinyproxy.running = true;
-                log('Tinyproxy started');
-                resolve();
-            }
-        });
-
-        proxy.stderr.on('data', data => console.log(`[TINYPROXY] ${data.toString().trim()}`));
-        proxy.on('close', code => {
-            state.tinyproxy.running = false;
-            log(`Tinyproxy exited: ${code}`);
-        });
+    return new Promise((res) => {
+        const conf = `/app/storage/tinyproxy.conf`;
+        const cfg = `User proxyuser\nGroup proxyuser\nPort ${PROXY_PORT}\nListen 0.0.0.0\nLogFile "/var/log/tinyproxy/tinyproxy.log"\nPidFile "/var/run/tinyproxy/tinyproxy.pid"\nMaxClients 50\nAllow 0.0.0.0/0\nDisableViaHeader Yes\nUpstream socks5 127.0.0.1:9050\n`;
+        fs.writeFileSync(conf, cfg);
+        const proxy = spawn('tinyproxy', ['-d', '-c', conf]);
+        setTimeout(() => { state.tinyproxy = true; log('Tinyproxy ready'); res(); }, 3000);
+        proxy.stdout.on('data', d => console.log(`[TINYPROXY] ${d.toString().trim()}`));
+        proxy.on('close', () => state.tinyproxy = false);
     });
 }
 
-// OpenVPN setup
+// OpenVPN (NO SUDO – use user-space tun)
 async function setupOpenVPN() {
     const ovpnPath = '/app/portmap.ovpn';
     const useBuiltIn = !fs.existsSync(ovpnPath);
     const configPath = useBuiltIn ? '/app/app.ovpn' : ovpnPath;
+    log(useBuiltIn ? 'Using built-in OVPN' : 'Using mounted OVPN');
 
-    if (useBuiltIn) {
-        log('No /app/portmap.ovpn found → using built-in app.ovpn');
-    } else {
-        log('Found /app/portmap.ovpn → using it');
-    }
+    return new Promise((res) => {
+        const vpn = spawn('openvpn', ['--config', configPath, '--dev-type', 'tun', '--dev', 'tun0', '--script-security', '2', '--up', '/etc/openvpn/update-resolv-conf', '--down', '/etc/openvpn/update-resolv-conf', '--verb', '3']);
+        const t = setTimeout(() => { log('OVPN timeout – continue'); res(); }, 45000);
 
-    return new Promise((resolve) => {
-        log('Starting OpenVPN...');
-        const vpn = spawn('sudo', ['openvpn', '--config', configPath, '--verb', '3']);
-
-        vpn.stdout.on('data', data => {
-            const line = data.toString();
-            console.log(`[OPENVPN] ${line.trim()}`);
-            if (line.includes('Initialization Sequence Completed')) {
-                state.openvpn.connected = true;
-                log('OpenVPN connected');
+        vpn.stdout.on('data', d => {
+            const l = d.toString();
+            console.log(`[OVPN] ${l.trim()}`);
+            if (l.includes('Initialization Sequence Completed')) {
+                clearTimeout(t);
+                state.openvpn = true;
                 parsePublicProxy(configPath);
-                resolve();
+                log('OpenVPN connected');
+                res();
             }
         });
-
-        vpn.stderr.on('data', data => console.error(`[OPENVPN ERR] ${data.toString().trim()}`));
-        vpn.on('close', code => {
-            state.openvpn.running = false;
-            log(`OpenVPN exited: ${code}`);
-        });
-
-        state.openvpn.running = true;
-
-        setTimeout(() => {
-            if (!state.openvpn.connected) {
-                log('OpenVPN timeout → continue without public IP');
-                state.openvpn.connected = true;
-                resolve();
-            }
-        }, 45000);
+        vpn.on('close', () => { state.openvpn = false; res(); });
     });
 }
 
-function parsePublicProxy(configPath) {
+function parsePublicProxy(path) {
     try {
-        const content = fs.readFileSync(configPath, 'utf8');
-        const match = content.match(/remote\s+([^\s]+)\s+(\d+)/);
-        if (match) {
-            state.publicProxy = {
-                type: 'http',
-                host: match[1],
-                port: parseInt(match[2]),
-                user: 'free',
-                pass: 'free'
-            };
-            log(`Public proxy: ${state.publicProxy.host}:${state.publicProxy.port}`);
-        }
-    } catch (e) {
-        log(`Parse error: ${e.message}`);
-    }
+        const m = fs.readFileSync(path, 'utf8').match(/remote\s+([^\s]+)\s+(\d+)/);
+        if (m) state.publicProxy = { host: m[1], port: +m[2], user: 'free', pass: 'free' };
+    } catch (e) {}
 }
 
-// Keepalive
-async function keepalive() {
-    try {
-        const agent = new SocksProxyAgent('socks5://127.0.0.1:9050');
-        await axios.get(`http://localhost:${PORT}/health`, { httpAgent: agent, timeout: 8000 });
-    } catch (e) {
-        log(`Keepalive failed: ${e.message}`);
-    }
-}
-
-// Routes
-app.get('/health', (req, res) => {
-    res.json({ status: 'healthy', services: state });
-});
-
-app.get('/info', (req, res) => {
-    res.json(state.publicProxy || { local: `http://localhost:${PROXY_PORT}` });
-});
-
+// Health
+app.get('/health', (req, res) => res.json({ status: 'ok', services: state }));
+app.get('/info', (req, res) => res.json(state.publicProxy || { local: `http://localhost:${PROXY_PORT}` }));
 app.get('/', (req, res) => {
-    const info = state.publicProxy || { host: 'localhost', port: PROXY_PORT, user: 'free', pass: 'free' };
-    res.send(`<!DOCTYPE html>
-<html><head><title>Tor Proxy</title><style>body{font-family:Arial;background:#1e3c72;color:#fff;padding:40px;text-align:center;}</style></head>
-<body><div style="background:rgba(255,255,255,0.1);padding:30px;border-radius:15px;max-width:500px;margin:auto;">
-<h1>Free Tor HTTP Proxy</h1>
-<p><strong>Host:</strong> ${info.host}<br><strong>Port:</strong> ${info.port}<br><strong>User:</strong> ${info.user}<br><strong>Pass:</strong> ${info.pass}</p>
-<p style="color:#a0f7a0;">All traffic via Tor</p>
-<p style="color:#ff9800;font-size:0.9em;">Ethical use only</p>
-</div></body></html>`);
+    const p = state.publicProxy || { host: 'localhost', port: PROXY_PORT, user: 'free', pass: 'free' };
+    res.send(`<!DOCTYPE html><html><head><title>Tor Proxy</title><style>body{font-family:Arial;background:#1e3c72;color:#fff;padding:40px;text-align:center;}</style></head><body><div style="background:rgba(255,255,255,0.1);padding:30px;border-radius:15px;max-width:500px;margin:auto;"><h1>Tor HTTP Proxy</h1><p><strong>Host:</strong> ${p.host}<br><strong>Port:</strong> ${p.port}<br><strong>User:</strong> free<br><strong>Pass:</strong> free</p><p style="color:#a0f7a0;">Via Tor</p></div></body></html>`);
 });
 
 // Start
 async function main() {
-    log('=== Starting Tor Proxy Service ===');
+    log('Starting services...');
     await setupTor();
     await setupTinyproxy();
     await setupOpenVPN();
-
-    app.listen(PORT, () => {
-        log(`Web UI: http://0.0.0.0:${PORT}`);
+    app.listen(PORT, '0.0.0.0', () => {
+        log(`UI: http://0.0.0.0:${PORT}`);
         log(`Proxy: http://0.0.0.0:${PROXY_PORT}`);
-        log('=== All services ready ===');
+        log('All ready');
     });
-
-    setInterval(keepalive, 5 * 60 * 1000);
 }
-
-main().catch(err => {
-    log(`FATAL: ${err.message}`);
-    process.exit(1);
-});
+main().catch(e => { log('FATAL: ' + e.message); process.exit(1); });
 EOF
 
-# === Create entrypoint.sh ===
+# Entrypoint
 RUN cat > /app/entrypoint.sh << 'EOF'
 #!/bin/bash
 set -e
-
-echo "==================================="
-echo "Tor to HTTP Proxy Container Starting"
-echo "==================================="
-
-if [ -f "/app/portmap.ovpn" ]; then
-    echo "Found /app/portmap.ovpn"
-else
-    echo "No /app/portmap.ovpn → using built-in config"
-fi
-
+echo "=== Tor Proxy Starting ==="
+[ -f /app/portmap.ovpn ] && echo "Using mounted OVPN" || echo "Using built-in OVPN"
 exec node /app/app.js
 EOF
-
 RUN chmod +x /app/entrypoint.sh
 
-# Expose ports
 EXPOSE 3000 8888
-
-# Health check
-HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
-    CMD curl -f http://localhost:3000/health || exit 1
-
-# Environment
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s CMD curl -f http://localhost:3000/health || exit 1
 ENV NODE_ENV=production
-
-# Use non-root user
 USER proxyuser
-
-# Entrypoint
 ENTRYPOINT ["/app/entrypoint.sh"]
