@@ -75,7 +75,7 @@ function setupTor() {
     return new Promise(resolve => {
         if (processes.tor) return resolve();
         const torrc = '/app/storage/torrc';
-        Fs.writeFileSync(torrc, `SocksPort 0.0.0.0:9050\nDataDirectory /app/storage/Tor_Data\nLog notice stdout\n`);
+        fs.writeFileSync(torrc, `SocksPort 0.0.0.0:9050\nDataDirectory /app/storage/Tor_Data\nLog notice stdout\n`);
         processes.tor = spawn('tor', ['-f', torrc]);
         const timeout = setTimeout(() => resolve(), 90000);
         processes.tor.stdout.on('data', d => {
