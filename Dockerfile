@@ -70,12 +70,12 @@ function waitForPort() {
     });
 }
 
-// === Tor ===
+// === Tor (bind to localhost only) ===
 function setupTor() {
     return new Promise(resolve => {
         if (processes.tor) return resolve();
         const torrc = '/app/storage/torrc';
-        fs.writeFileSync(torrc, `SocksPort 0.0.0.0:9050\nDataDirectory /app/storage/Tor_Data\nLog notice stdout\n`);
+        fs.writeFileSync(torrc, `SocksPort 127.0.0.1:9050\nDataDirectory /app/storage/Tor_Data\nLog notice stdout\n`);
         processes.tor = spawn('tor', ['-f', torrc]);
         const timeout = setTimeout(() => resolve(), 90000);
         processes.tor.stdout.on('data', d => {
@@ -90,7 +90,7 @@ function setupTor() {
     });
 }
 
-// === Tinyproxy (START FIRST!) ===
+// === Tinyproxy (bind to localhost only) ===
 function setupTinyproxy() {
     return new Promise(resolve => {
         if (processes.tinyproxy) return resolve();
@@ -98,11 +98,11 @@ function setupTinyproxy() {
         const config = `User proxyuser
 Group proxyuser
 Port ${PROXY_PORT}
-Listen 0.0.0.0
+Listen 127.0.0.1
 LogFile "/var/log/tinyproxy/tinyproxy.log"
 PidFile "/var/run/tinyproxy/tinyproxy.pid"
 MaxClients 200
-Allow 0.0.0.0/0
+Allow 127.0.0.1
 DisableViaHeader Yes
 Upstream socks5 127.0.0.1:9050
 `;
@@ -110,7 +110,7 @@ Upstream socks5 127.0.0.1:9050
         processes.tinyproxy = spawn('tinyproxy', ['-d', '-c', conf]);
         setTimeout(() => {
             state.tinyproxy = true;
-            log(`Tinyproxy LISTENING on :${PROXY_PORT}`);
+            log(`Tinyproxy LISTENING on 127.0.0.1:${PROXY_PORT}`);
             resolve();
         }, 3000);
         processes.tinyproxy.on('close', () => { state.tinyproxy = false; });
@@ -228,17 +228,21 @@ app.get('/', (req, res) => res.send(`
 async function main() {
     log('Starting...');
     writeSSHKey();
-    await setupTor();
-    await setupTinyproxy();   // ← FIRST
-    await setupSSHTunnel();   // ← AFTER port 8888 open
-    startKeepAlive();
-
+    
+    // Start Express server FIRST so Render detects the correct port
     app.listen(PORT, '0.0.0.0', () => {
         log(`Web UI: http://0.0.0.0:${PORT}`);
-        log(`Proxy: http://0.0.0.0:${PROXY_PORT}`);
-        log(`PUBLIC: http://cdns-50919.portmap.host:50919`);
-        log('READY!');
+        log('Express server ready - now starting proxy services...');
     });
+    
+    // Then start background services
+    await setupTor();
+    await setupTinyproxy();
+    await setupSSHTunnel();
+    startKeepAlive();
+    
+    log('ALL SERVICES READY!');
+    log(`PUBLIC PROXY: http://cdns-50919.portmap.host:50919`);
 }
 
 process.on('SIGTERM', () => {
