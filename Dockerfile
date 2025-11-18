@@ -1,4 +1,4 @@
-FROM ubuntu:22.04
+FROM node:20
 
 # Prevent interactive prompts
 ENV DEBIAN_FRONTEND=noninteractive
